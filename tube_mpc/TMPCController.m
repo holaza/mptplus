@@ -8,21 +8,20 @@ function TMPC = TMPCController(model,N,option)
 %  https://github.com/holaza/mptplus/wiki
 % ------------------------------------------------------------------------
 % INPUTS:
-%      model                - MPT3 object with ULTISystem 
+%      model                - MPT3 object with ULTISystem
 %      N                    - Prediction horizon
 % OPTIONS:
 %      Tube_tol           - allowed tollerace (default = 1e-4 )
 %      Tube_MaxIter       - maximal number of itterations (default = 1e3)
-%      Tube_approx        - {0/1} box approximation of the final Tube
-%      solType              - {0/1} defines the retuned optimized values 
+%      solType              - {0/1} defines the retuned optimized values
 %                             (the default value is 0):
-%                             0: TMPC returns exact Tube MPC outputs:  
-%                                     [u_opt, x_opt] 
-%                             1: TMPC returns compact Tube MPC outputs: 
+%                             0: TMPC/TEMPC returns exact TMPC outputs:
+%                                           [u_opt, x_opt]
+%                             1: TMPC/TEMPC returns compact TMPC outputs:
 %                                     Utube = u_opt + K*( x - x_opt ),
 %                                where [u_opt, x_opt] are the original TMPC
-%                                outputs, K is the LQR for the given 
-%                                model (given as u = K*x), and x is the  
+%                                outputs, K is the LQR for the given
+%                                model (given as u = K*x), and x is the
 %                                state measurement.
 %     LQRstability          - {0} Does not compute any terminal penalty/set
 %                             {1} Computes the terminal penalty/set w.r.t.
@@ -34,11 +33,11 @@ function TMPC = TMPCController(model,N,option)
 % % EXAMPLE:
 % % LTI system
 % model = ULTISystem('A', [1, 1; 0, 1], 'B', [0.5; 1], 'E', [1, 0; 0, 1]);
-% model.u.min = [-1]; 
+% model.u.min = [-1];
 % model.u.max = [ 1];
-% model.x.min = [-5; -5]; 
+% model.x.min = [-5; -5];
 % model.x.max = [ 5;  5];
-% model.d.min = [-0.1; -0.1]; 
+% model.d.min = [-0.1; -0.1];
 % model.d.max = [ 0.1;  0.1];
 % % Penalty functions
 % model.x.penalty = QuadFunction(diag([1, 1]));
@@ -51,23 +50,12 @@ function TMPC = TMPCController(model,N,option)
 % TMPC = TMPCController(model,N,option)
 % % TMPC evaluation
 % x0 = [-5; 2]; % Initial condition
-% u = TMPC.evaluate(x0) % MPC evaluation
+% u_implicit = TMPC.evaluate(x0) % Implicit MPC evaluation
+% % Computation of Explicit solution
+% TEMPC = TMPC.toExplicit();
+% u_implicit = TEMPC.evaluate(x0)  % Explicit MPC evaluation
+% [u, feasible, openloop] = TEMPC.evaluate(x0) % Enriched output
 % ------------------------------------------------------------------------
-
-% REFERENCES:
-% [1] https://github.com/holaza/mptplus
-% [2] S. Rakovi´c and D. Mayne. A simple tube controller for
-% efficient robust model predictive control of constrained
-% linear discrete time systems subject to bounded disturbances.
-% IFAC Proceedings Volumes, 38(1):241–246,
-% 2005. ISSN 1474-6670. doi: https://doi.org/10.3182/20
-% 050703-6-CZ-1902.00440. 16th IFAC World Congress.
-% [3] Invariant Approximations of the Minimal Robust Positively Invariant 
-% Set by S. V. Rakovic, E. C. Kerrigan, K. I. Kouramas, D. Q. Mayne
-% IEEE TRANSACTIONS ON AUTOMATIC CONTROL, VOL. 50, NO. 3, MARCH 2005
-% URL: https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=1406138
-% ------------------------------------------------------------------------
-
 
 %% Checks / initial setup
 % Perform checks:
@@ -79,11 +67,10 @@ end
 
 % set options/default values
 ip = inputParser;
-% ip.addParameter('eMPC', 0);
+% ip.addParameter('TEMPC', 0);
 ip.addParameter('adjList', 0);
 ip.addParameter('Tube_tol', 1e-4);
 ip.addParameter('Tube_MaxIter', 1e3);
-ip.addParameter('Tube_approx', 0);
 ip.addParameter('solType', 1);
 ip.addParameter('LQRstability', 0);
 if nargin == 3, ip.parse(option{:}); else ip.parse(); end
@@ -95,7 +82,7 @@ secOutputs = ConstructSets(model,options);
 secOutputs.N = N;
 
 % Define Tube MPC Problem
-secOutputs = DefineMPCProblem(secOutputs,model,options);
+secOutputs = DefinTEMPCProblem(secOutputs,model,options);
 
 %% Construction of MPC
 % Preconsturct an MPC object
@@ -126,7 +113,6 @@ function [secOutputs] = ConstructSets(model,options)
 %           model                   - model of the system (as MPT3 object)
 %           options.Tube_tol        - tollerence for the MRPIS
 %           options.Tube_MaxIter    - maximal number of itterations for MRPIS
-%           options.Tube_approx     - {0,1} request for MRPIS approximation
 % OUTPUTS:
 %           secOutputs.Tube         - minimal robust positive invariant set
 %           secOutputs.Xset         - robustustified state constraint
@@ -137,6 +123,7 @@ function [secOutputs] = ConstructSets(model,options)
 %           secOutputs.nu           - number of inputs
 %           secOutputs.Xset_full    - state constraint
 %           secOutputs.Uset_full    - input constraint
+%           secOutputs.dUset_full   - delta input constraint
 
 % Bounded additive uncertainty
 if isprop(model.d,'setConstraint')
@@ -145,7 +132,7 @@ else
     W = Polyhedron('lb',model.d.min,'ub',model.d.max);
 end
 W = model.E*W;
-W = Polyhedron('lb',-max(abs(W.V)),'ub',max(abs(W.V)));
+Wset = Polyhedron('lb',-max(abs(W.V)),'ub',max(abs(W.V)));
 
 % Constraints handling
 if isprop(model.x,'setConstraint')
@@ -170,8 +157,8 @@ end
 
 % Robust positive invariant set
 K = model.LQRGain;  % LQR controller as u = K*x
-Tube = approx_mRPIS(model.A,model.B,K,W, ...
-                options.Tube_tol,options.Tube_MaxIter,options.Tube_approx);
+Tube = approx_mRPIS(model.A,model.B,K,Wset, ...
+    options.Tube_tol,options.Tube_MaxIter);
 if Tube.isEmptySet
     error('Cannot continue as the minimal positive invariant set is empty!')
 end
@@ -187,25 +174,31 @@ Uset = Uset_full - UKtube;
 if Uset.isEmptySet
     error('Cannot continue as the input constraint set is empty!')
 end
+% Delta input constraints robustification
+dUset = dUset_full - UKtube;
 
 secOutputs.Tube = Tube;
+secOutputs.Wset = Wset;
 secOutputs.Xset = Xset;
 secOutputs.Uset = Uset;
+secOutputs.dUset = dUset;
 secOutputs.Xset_full = Xset_full;
 secOutputs.Uset_full = Uset_full;
+secOutputs.dUset_full = dUset_full;
 secOutputs.K = K;
 secOutputs.nu = model.nu;
 secOutputs.nx = model.nx;
 end
 
 
-function [secOutputs] = DefineMPCProblem(secOutputs,model,options)
+function [secOutputs] = DefinTEMPCProblem(secOutputs,model,options)
 % Function defines optimization problem of an MPC policy
 %
 % INPUTS:
 %     secOutputs.N          - Prediction horizon
 %     secOutputs.Xset_full  - original state consraint
 %     secOutputs.Tube       - minimal robust invariant set
+%     secOutputs.Wset       - disturbance set
 %     secOutputs.Xset       - robustustified state constraint
 %     secOutputs.Uset       - robustustified input constraint
 %     secOutputs.K          - LQR gain (u = K*x)
@@ -225,26 +218,21 @@ function [secOutputs] = DefineMPCProblem(secOutputs,model,options)
 % secOutputs.OptimProblem.ExactForm_Param_Returned   - opt returned parameters (YALMIP)
 % secOutputs.OptimProblem.YALMIP_settings            - opt settings (YALMIP)
 % secOutputs.OptimProblem.options                    - tube MPC options
-% secOutputs.OptimProblem.MPCoptimizers.compact      - optimizer that retuns 
-%                                                      Utube = u_opt + 
+% secOutputs.OptimProblem.MPCoptimizers.implicit     - optimizer that retuns
+%                                                      Utube = u_opt +
 %                                                      + K*(x-x_opt) (YALMIP)
-% secOutputs.OptimProblem.MPCoptimizers.exact        - optimizer that retuns 
+% secOutputs.OptimProblem.MPCoptimizers.explicit     - optimizer that retuns
 %                                                      [u_opt, x_opt]  (YALMIP)
 
+
 % Determine MPC formulations that were given by the user
-MPCforms = DetermineMPCFormulations(model);
+MPCforms = DeterminTEMPCFormulations(model);
 
 
 % Define decision variables - YALMIP variables
 X0 = sdpvar(model.nx,1);
 u = sdpvar(model.nu,secOutputs.N,'full');
 x = sdpvar(model.nx,secOutputs.N+1,'full');
-% if isprop(model.x,'reference'), xref = sdpvar(model.nx,1,'full'); end
-% if  any(isprop(model.u,'deltaPenalty'), ...
-%         isprop(model.u,'deltaMin'), ...
-%         isprop(model.u,'deltaMax'))
-%     uprev = sdpvar(model.nu,1,'full'); 
-% end
 
 % Initialize constraints and objective function
 con = [];
@@ -309,24 +297,19 @@ if MPCforms.deltaucon
     end
 end
 
+
 % Optimization settings - silent verbose mode
 opt_settings = sdpsettings('verbose',0);
 
 p_required = X0;
+if any([MPCforms.deltaucon,MPCforms.deltaupen])
+    p_required = [p_required; uprev];
+end
+% end
 
-% ------------------------- This is not needed ----------------------------
-% OptimProblem.Constraints = con;
-% OptimProblem.Objective = obj;
-% OptimProblem.Param_Required = p_required;
-% OptimProblem.CompactForm_Param_Returned = u(:,1) + secOutputs.K*( X0 - x(:,1));
-% % OptimProblem.ExactForm_Param_Returned = [u(:,1); x(:,1)];
-% OptimProblem.ExactForm_Param_Returned = [u(:); x(:)];
-% OptimProblem.YALMIP_settings = opt_settings;
-% -------------------------------------------------------------------------
-
-% Note that the eMPC will have always p_return = [u(:,1); x(:,1)]. If
-% required, by solType == 1, then this primal function will be overwritten
-% inside of the .toExplicit function
+% Note that the TEMPC will have always p_return = [u(:,1); x(:,1)].
+% If required, by solType ==1, then this primal function will be
+% overwritten inside of the .toExplicit function
 OptimProblem.options = options;
 OptimProblem.MPCforms = MPCforms;
 OptimProblem.MPCproblem = Opt(con, obj, p_required, ...
@@ -342,45 +325,46 @@ end
 
 
 function [model] = ComputeLQRSet(model)
-    % Import parameters from ULTI system to LTI system
-    LTI_model = LTISystem('A', model.A, 'B', model.B);
-    LTI_model.x.penalty = QuadFunction( model.x.penalty.weight );
-    LTI_model.u.penalty = QuadFunction( model.u.penalty.weight );
-    % Import constraints
-    if model.x.hasFilter('setConstraint')
-        LTI_model.x.setConstraint = model.x.setConstraint;
-    else
-        LTI_model.x.min = model.x.min;
-        LTI_model.x.max = model.x.max;
-    end
-    if model.u.hasFilter('setConstraint')
-        LTI_model.u.setConstraint = model.u.setConstraint;
-    else
-        LTI_model.u.min = model.u.min;
-        LTI_model.u.max = model.u.max;
-    end
-    % Generate the terminal set
-    LTI_model.x.with('terminalSet');
-    LTI_model.x.terminalSet = LTI_model.LQRSet;
-    % Generate the terminal penalty
-    [ Klqr, P ] = dlqr( model.A, model.B, model.x.penalty.weight, model.u.penalty.weight );
-    K = -Klqr;
-    LTI_model.x.with('terminalPenalty');
-    LTI_model.x.terminalPenalty = QuadFunction( P );
-    % Export parameters from LTI system to ULTI system
-    % Note, the original Termianl Set and Termianl Penalty are overwirtten
-    if model.x.hasFilter('terminalPenalty')
-        fprintf('Warning: The original terminal penalty is overwritten.\n');
-    else
-        model.x.with('terminalPenalty');
-    end
-    if model.x.hasFilter('terminalSet')
-        fprintf('Warning: The original terminal set is overwritten.\n');
-    else
-        model.x.with('terminalSet');
-    end
-    model.x.terminalSet = LTI_model.x.terminalSet;
-    model.x.terminalPenalty = LTI_model.x.terminalPenalty;
+% Import parameters from ULTI system to LTI system
+LTI_model = LTISystem('A', model.A, 'B', model.B);
+LTI_model.x.penalty = QuadFunction( model.x.penalty.weight );
+LTI_model.u.penalty = QuadFunction( model.u.penalty.weight );
+% Import constraints
+if model.x.hasFilter('setConstraint')
+    LTI_model.x.setConstraint = model.x.setConstraint;
+else
+    LTI_model.x.min = model.x.min;
+    LTI_model.x.max = model.x.max;
+end
+if model.u.hasFilter('setConstraint')
+    LTI_model.u.setConstraint = model.u.setConstraint;
+else
+    LTI_model.u.min = model.u.min;
+    LTI_model.u.max = model.u.max;
+end
+% Generate the terminal set
+LTI_model.x.with('terminalSet');
+LTI_model.x.terminalSet = LTI_model.LQRSet;
+% Generate the terminal penalty
+[ Klqr, P ] = dlqr( model.A, model.B, model.x.penalty.weight, model.u.penalty.weight );
+K = -Klqr;
+LTI_model.x.with('terminalPenalty');
+LTI_model.x.terminalPenalty = QuadFunction( P );
+% Export parameters from LTI system to ULTI system
+% Note, the original termianl set and termianl penalties are
+% oberwirtten
+if model.x.hasFilter('terminalPenalty')
+    fprintf('Warning: The original terminal penalty is overwritten.\n');
+else
+    model.x.with('terminalPenalty');
+end
+if model.x.hasFilter('terminalSet')
+    fprintf('Warning: The original terminal set is overwritten.\n');
+else
+    model.x.with('terminalSet');
+end
+model.x.terminalSet = LTI_model.x.terminalSet;
+model.x.terminalPenalty = LTI_model.x.terminalPenalty;
 end
 
 
@@ -392,7 +376,7 @@ function ShowProgress(operation, k, kf)
 %          ttime     - time of the previous operation
 
 if k == 1, fprintf(1, strcat(operation,'       :')); end
-    
+
 kkf = fix(k/kf*100);
 if kkf < 10
     fprintf(1, ' \b\b\b\b%d %%', kkf);
@@ -417,11 +401,11 @@ if nargin < 5, tol = 1e-4; end
 if nargin < 6, MaxIter = 1000; end
 if nargin < 7, Approx = 0; end
 
-% Closed-loop/autonomous system matrix 
+% Closed-loop/autonomous system matrix
 Acl = A + B*K;
 
 % Problem size
-nx = size(Acl, 1); 
+nx = size(Acl, 1);
 
 % Initial values
 s = 0; % "s" is integer going toward zero: s -> 0
@@ -452,17 +436,18 @@ while( alpha > tol/( tol + Ms ) ) && ( s < MaxIter )
 end
 
 % Eq(2): Fs = Minkowski_Sum_{i=0}^{s-1}( Acl^(i)*W ), where F_0 = {0}
-Fs = W; 
+Fs = W;
 for i = 1 : (s - 1)
     ShowProgress('Finalizing...         ',i,s-1)
     Fs = Fs + Acl^(i)*W;
     Fs.minVRep();
-%     if size(Fs.V,1) > 2e5
-%         Fs = Fs.outerApprox;
-%     end
+    %     if size(Fs.V,1) > 2e5
+    %         Fs = Fs.outerApprox;
+    %     end
 end
 F_alpha = (1 - alpha)^(-1)*Fs;
 compTime = toc;
+% fprintf('...done! (computation time: %.2f, #itterations: %.0f, #halfspaces = %.0f)\n',compTime,s,size(Fs.H,1))
 fprintf('\b (computation time: %.2f, #itterations: %.0f, #halfspaces = %.0f)\n',compTime,s,size(Fs.H,1))
 
 if Approx
@@ -473,10 +458,10 @@ if Approx
     fprintf('The Minimal Robust Invariant Set was approximated! (Volume increased by %.0f%%)\n',increaseVOl)
     F_alpha = (1 - alpha)^(-1)*Fs;
 end
-end 
+end
 
 
-function  [form] = DetermineMPCFormulations(model)
+function  [form] = DeterminTEMPCFormulations(model)
 % Available MPC forms
 form.deltaucon = 0;
 form.deltaupen = 0;
@@ -485,7 +470,7 @@ form.xtrack = 0;
 
 if  any([isprop(model.u,'deltaMin'),isprop(model.u,'deltaMax')])
     form.deltaucon = 1;
-    fprintf('MPC formulation: Delta-u constraints detected !\n')
+    fprintf('MPC formulation: Delta-u constraints detected!\n')
 end
 
 if isprop(model.u,'deltaPenalty')
