@@ -73,6 +73,7 @@ classdef PolynomialMPC < EMPCController
             ip.addParameter('verbose', 1);
             ip.addParameter('rel_tol', 1e-6);
             ip.addParameter('psolvers', [3 1 5 2 4 0]);
+            ip.addParameter('gridreg', 10);
             if nargin == 2, ip.parse(option{:}); else ip.parse(); end
             options = ip.Results;
 
@@ -86,8 +87,12 @@ classdef PolynomialMPC < EMPCController
             aproximation_degree = options.aprx_degree;
             % degree of the polya polynomial
             polya_degree = options.polya_degree;
+            % grid point for approximation (obj function)
+            gridreg = options.gridreg;
+            % verbose option
+            verbose = options.verbose;
             % compute the approximation
-            [polynomial, controller, info] = xu_approx_robust_mpt3(ctrl, XUset, aproximation_degree, polya_degree);
+            [polynomial, controller, info] = xu_approx_robust_mpt3(ctrl, XUset, aproximation_degree, polya_degree, gridreg,verbose);
 
             % Assign PROPERTIES
             obj.polynomial = polynomial;
@@ -155,11 +160,19 @@ end
 
 
 
-function [p_opt, ctrl, runtime] = xu_approx_robust_mpt3(ctrl, XUset, order, polya_degree, gridreg)
+function [p_opt, ctrl, runtime] = xu_approx_robust_mpt3(ctrl, XUset, order, polya_degree, gridreg, verbose)
 % find polynomial u(x)=a'*x s.t. [x; u] \in XU(i) \forall x \in P(i), \forall i
 
 if nargin < 4, polya_degree = 1; end
 if nargin < 5, gridreg = 10; end
+if nargin < 6, verbose = 0; end
+
+if verbose
+    fprintf('Performing polynomial approximation ...\n')
+else
+    fprintf('Performing polynomial approximation ... ')
+end
+
 usecost = true;
 yalmip('clear');
 
@@ -177,7 +190,7 @@ end
 objrob = 0;
 Frob = set([]);
 
-fprintf('robustifying constraints...\n');
+if verbose, fprintf('robustifying constraints...\n'); end
 tic
 for i = 1:ctrl.nr
     obj = 0;
@@ -197,7 +210,7 @@ for i = 1:ctrl.nr
         u_aprx = xu_poly_eval(a, x0(ii, :)');
         obj = obj + norm(u_opt - u_aprx, 1);
     end
-    [FF, OO] = robustify(F, obj, sdpsettings('robust.polya', polya_degree));
+    [FF, OO] = robustify(F, obj, sdpsettings('robust.polya', polya_degree,'verbose',verbose));
     Frob = Frob + FF;
     objrob = objrob + OO;
 end
@@ -205,9 +218,9 @@ if isa(objrob, 'double') || ~usecost
     objrob = [];
 end
 runtime.robustify = toc;
-fprintf('\nsolving the problem...\n');
+if verbose, fprintf('\nsolving the problem...\n'); end
 tic
-sol = optimize(Frob, objrob, sdpsettings('robust.polya', polya_degree));
+sol = optimize(Frob, objrob, sdpsettings('robust.polya', polya_degree,'verbose',verbose));
 runtime.lp = toc;
 runtime.sol = sol;
 
@@ -215,6 +228,12 @@ runtime.sol = sol;
 p_opt = cell(1, length(a));
 for i = 1:length(a)
     p_opt{i} = double(a{i});
+end
+
+if verbose
+    fprintf('\t... done! (computation time %.2f seconds)\n',runtime.robustify+runtime.lp);
+else
+    fprintf('... done! (computation time %.2f seconds)\n',runtime.robustify+runtime.lp);
 end
 end
 
@@ -307,6 +326,8 @@ if nargin < 2, Options = []; end
 if ~isfield(Options, 'psolvers'), Options.psolvers = [3 1 5 2 4 0]; end
 if nargin < 3, LyapFcn = []; end
 
+fprintf('Computing stability set ...');
+
 % Create the XU set
 startt = clock;
 XU = mpt_XUsetPWALyap_mpt3(ctrl, Options, LyapFcn);
@@ -322,6 +343,8 @@ if ~isBounded(XUproj)
     error([mfilename ': projected XU set is not bounded, probably due to numerical problems.']);
 end
 projectiontime = etime(clock, startt);
+
+fprintf(' done ! (computation time %.2f seconds) ...\n',xutime+projectiontime);
 
 % Define outputs
 out.XU = XU;
@@ -793,7 +816,11 @@ c1 = LyapFcn.Set(indx).getFunction('obj').g;
 % !!! We are not assuming PWA dynamics !!!
 A = ctrl.model.A;
 B = ctrl.model.B;
-f = ctrl.model.f;
+if isempty(ctrl.model.f)
+    f = zeros(size(A,1),1);
+else
+    f = ctrl.model.f;
+end
 
 % System dimensions
 nx = ctrl.nx;
