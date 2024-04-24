@@ -58,6 +58,7 @@ classdef ExplicitTubeMPCController < EMPCController
             end
         end
 
+
         function [obj] = createAdjList(obj)
             % Creates the adjacency list for the given partition
             % The resulting list can by found in:
@@ -81,7 +82,7 @@ classdef ExplicitTubeMPCController < EMPCController
             end
             % adj_list = MPT_verify_graph(eMPC.partition.Set,adj_list);
             obj.optimizer.setInternal('adj_list', adj_list);
-        end % function createAdjList
+        end
 
         function [ ClosedLoopData ] = simulate(obj, xinit, Nsim, varargin)
             % [ ClosedLoopData ] = simulate(obj, xinit, Nsim, varargin)
@@ -150,16 +151,14 @@ classdef ExplicitTubeMPCController < EMPCController
             else
                 [ ClosedLoopData ] = obj.simulate@EMPCController(xinit, Nsim, varargin{:});
             end % if ( solType == 0 )
-        end % function simulate
+        end % function
 
         function [] = indexPartition( obj, indices2depict, figureHandle )
-            % Function indexPartition plot parition and depicts indices of each
+            % Function indexPartition plot parition and  depicts indices of each
             % critical region.
             obj.partition.plot
             depictIndices( obj, [1 : obj.nr], gcf )
-        end % function indexPartition
-
-
+        end
 
     end
 end

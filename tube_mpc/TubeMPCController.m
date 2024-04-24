@@ -204,7 +204,7 @@ classdef TubeMPCController < MPCController
                 nx = mpc.TMPCparams.nx;
                 nu = mpc.TMPCparams.nu;
                 K = mpc.TMPCparams.K;
-                W = mpc.TMPCparams.Wset;
+                W = mpc.TMPCparams.Pw;
                 A = mpc.model.A;
                 B = mpc.model.B;
                 Q = mpc.model.x.penalty.H;
@@ -254,6 +254,6 @@ classdef TubeMPCController < MPCController
                 [ ClosedLoopData ] = obj.simulate@MPCController(xinit, Nsim, varargin{:});
             end % if ( solType == 0 )
         end % function
-
     end
+
 end
