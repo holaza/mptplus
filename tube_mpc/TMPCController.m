@@ -35,7 +35,9 @@ function TMPC = TMPCController(model,N,option)
 %                              given by the user)
 %     Kz                    - terminal LQR 
 %     Pz                    - terminal cost (when Kz is used) 
-%
+%     qa                    - weighting constant to penalize the elasticity
+%                             of the tube (used only when 
+%                             TubeType = 'elastic')
 % OUTPUTS:
 %      TMPC                 - tube MPC policy (MPT3 object)
 % ------------------------------------------------------------------------
@@ -74,30 +76,33 @@ function TMPC = TMPCController(model,N,option)
 
 %% Checks / initial setup
 % Perform checks:
-if nargin < 2, error('MPT+: Ups, not enough inputs were selected'); end
+if nargin < 2, error('MPTplus: Ups, not enough inputs were selected'); end
 % We do not support parametric uncertainties
 if iscell(model.A) || iscell(model.B)
-    error('MPT+: Implemented Tube MPC design method does not support parametric uncertainties (LPV systems), yet.')
+    error('MPTplus: Implemented Tube MPC design method does not support parametric uncertainties (LPV systems), yet.')
 end
 
 % Define option validation handles
 validScalarPosNum = @(x) isnumeric(x) && isscalar(x) && (x > 0);
+validScalar = @(x) isnumeric(x) && isscalar(x) && (x >= 0);
 isBinary = @(x) ismember(x,[0 1]);
 isValidMatrix = @(x) all([all(~isnan(x(:))),all(isnumeric(x(:)))]);
-isValidTubeType = @(x) any(strcmpi(x,{'explicit','implicit'}));
+isValidTubeType = @(x) any(strcmpi(x,{'explicit','implicit','elastic'}));
 
 % set options/default values
 ip = inputParser;
 % ip.addParameter('TEMPC', 0);
-ip.addParameter('adjList', 0, isBinary);
-ip.addParameter('Tube_tol', 1e-4, validScalarPosNum);
-ip.addParameter('Tube_MaxIter', 1e3, validScalarPosNum);
-ip.addParameter('solType', 1, isBinary);
-ip.addParameter('LQRstability', 0, isBinary);
-ip.addParameter('TubeType', 'explicit', isValidTubeType);
-ip.addParameter('Nz', 0, validScalarPosNum);
-ip.addParameter('Kz', nan, isValidMatrix);
-ip.addParameter('Pz', nan, isValidMatrix);
+ip.addParameter('adjList', 0, isBinary);                        % General
+ip.addParameter('Tube_tol', 1e-4, validScalarPosNum);           % General
+ip.addParameter('Tube_MaxIter', 1e3, validScalarPosNum);        % General
+ip.addParameter('solType', 1, isBinary);                        % General
+ip.addParameter('LQRstability', 0, isBinary);                   % General
+ip.addParameter('TubeType', 'explicit', isValidTubeType);       % General
+ip.addParameter('Nz', 0, validScalar);                          % Implicit TMPC 
+ip.addParameter('Kz', nan, isValidMatrix);                      % Implicit TMPC / Elastic TMPC
+ip.addParameter('Pz', nan, isValidMatrix);                      % Implicit TMPC
+ip.addParameter('qa', 1e0, validScalarPosNum);                  % Elastic TMPC
+ip.addParameter('forceRigidTubeInETMPC', 0, isBinary);          % Elastic TMPC
 if nargin == 3, ip.parse(option{:}); else ip.parse(); end
 options = ip.Results;
 
@@ -115,10 +120,13 @@ secOutputs = PreProcessing_Common(workingModel,secOutputs,options);
 % Precompute all necessary components for implicit/explicit tube approaches
 if strcmpi(options.TubeType,'implicit')
     secOutputs = PreProcessing_ImplicitTube(workingModel,secOutputs);
-    secOutputs = DefineMPCProblem_ImplicitTube(secOutputs,workingModel,options);
+    secOutputs = DefineMPCProblem_ImplicitTube(workingModel,secOutputs,options);
 elseif strcmpi(options.TubeType,'explicit')
     secOutputs = PreProcessing_ExplicitTube(workingModel,secOutputs);
-    secOutputs = DefineMPCProblem_ExplicitTube(secOutputs,workingModel,options);
+    secOutputs = DefineMPCProblem_ExplicitTube(workingModel,secOutputs,options);
+elseif strcmpi(options.TubeType,'elastic')
+    secOutputs = PreProcessing_ElasticTube(workingModel,secOutputs,options);
+    secOutputs = DefineMPCProblem_ElasticTube(workingModel,secOutputs,options);
 end
 
 %% Construction of MPC
@@ -222,7 +230,7 @@ end
 
 
 function [PP] = NormalizePolyhedron(P)
-if any(P.b <= 0), error('MPT+: Ups, normalization of the polyhedron failed!'); end
+if any(P.b <= 0), error('MPTplus: Ups, normalization of the polyhedron failed!'); end
 PP = Polyhedron('A',P.A.*P.b.^(-1),'b',P.b.*P.b.^(-1));
 end
 
@@ -235,11 +243,11 @@ secOutputs.Pz = options.Pz;
 
 % Is Nz valid
 if any([isnan(options.Nz),~isnumeric(options.Nz)])
-    error('MPT+: Parameter "Nz" must be numeric')
+    error('MPTplus: Parameter "Nz" must be numeric')
 elseif options.Nz > secOutputs.N
-    error('MPT+: Parameter "Nz" cannot be larger than the prediciton horizon "N"!')
+    error('MPTplus: Parameter "Nz" cannot be larger than the prediciton horizon "N"!')
 elseif options.Nz == secOutputs.N
-    warning('MPT+: Parameter "Nz" is equal to the prediction horizon "N".')
+    warning('MPTplus: Parameter "Nz" is equal to the prediction horizon "N".')
 end
 
 
@@ -247,7 +255,7 @@ end
 if options.Nz > 0
     % Both Kz and Pz need to be given
     if any([sum(isnan(options.Kz(:))),sum(isnan(options.Pz(:)))])
-        issuestr = 'MPT+: not enough inputs were selected. When requesting Nz > 0, then it is also needed to provide: \n';
+        issuestr = 'MPTplus: not enough inputs were selected. When requesting Nz > 0, then it is also needed to provide: \n';
         if isnan(options.Kz)
             issuestr = [issuestr, '\t\tLQR terminal gain "Kz" \n'];
         end
@@ -260,21 +268,21 @@ if options.Nz > 0
     % Are Kz/Pz of right dimensions?
     [t1,t2] = size(options.Kz);
     if any([t1 ~= model.nu,t2 ~= model.nx])
-        error('MPT+: Provided matrix "Kz" has invalid dimensions!')
+        error('MPTplus: Provided matrix "Kz" has invalid dimensions!')
     end
     [t1,t2] = size(options.Pz);
     if any([t1 ~= t2,t2 ~= model.nx])
-        error('MPT+: Provided matrix "Pz" has invalid dimensions!')
+        error('MPTplus: Provided matrix "Pz" has invalid dimensions!')
     end
 
     % Is the Kz stabilizing?
     if any(abs(eig(model.A + model.B*options.Kz)) >= 1)
-        warning('MPT+: Non-stabilizing LQR gain "Kz" was provided, i.e., (abs(eig(A+B*Kz))<1) does not hold.')
+        warning('MPTplus: Non-stabilizing LQR gain "Kz" was provided, i.e., (abs(eig(A+B*Kz))<1) does not hold.')
     end
 
     % Is the Pz positive semi-definite?
     if any(eig(options.Pz) < 0)
-        warning('MPT+: Provided terminal penalty "Pz" is not semi-positive define, i.e., all(eig(options.Pz) <= 0) does not hold.')
+        warning('MPTplus: Provided terminal penalty "Pz" is not semi-positive define, i.e., all(eig(options.Pz) <= 0) does not hold.')
     end
 end
 end
@@ -339,12 +347,12 @@ Tube = {};
 % State constraints robustification
 Px_robust = Polyhedron('A',secOutputs.Px.A,'b',secOutputs.Px.b - fx);
 if Px_robust.isEmptySet
-    error('MPT+: Cannot continue as the state constraint set is empty!')
+    error('MPTplus: Cannot continue as the state constraint set is empty!')
 end
 % Input constraints robustification
 Pu_robust = Polyhedron('A',secOutputs.Pu.A,'b',secOutputs.Pu.b - fu);
 if Pu_robust.isEmptySet
-    error('MPT+: Cannot continue as the input constraint set is empty!')
+    error('MPTplus: Cannot continue as the input constraint set is empty!')
 end
 % Delta input constraints robustification
 if any([isprop(model.u,'deltaMin'), isprop(model.u,'deltaMax')])
@@ -412,7 +420,7 @@ end
 
 
 
-function [secOutputs] = DefineMPCProblem_ImplicitTube(secOutputs,model,options)
+function [secOutputs] = DefineMPCProblem_ImplicitTube(model,secOutputs,options)
 
 % Determine MPC formulations that were given by the user
 MPCforms = DeterminTEMPCFormulations(model);
@@ -507,7 +515,7 @@ end
 
 if secOutputs.Nz
     Qz = model.x.penalty.weight + secOutputs.Kz'*model.u.penalty.weight*secOutputs.Kz;
-    if any(eig(Qz') <= 0), error('MPT+: Ups, penalty matrix Qz is not positive def!'); end
+    if any(eig(Qz') <= 0), error('MPTplus: Ups, penalty matrix Qz is not positive def!'); end
 
     for k = 1:secOutputs.Nz
         % Complete state predictions
@@ -567,7 +575,7 @@ secOutputs.OptimProblem = OptimProblem;
 end
 
 
-function [secOutputs] = DefineMPCProblem_ExplicitTube(secOutputs,model,options)
+function [secOutputs] = DefineMPCProblem_ExplicitTube(model,secOutputs,options)
 % Function defines optimization problem of an MPC policy
 %
 % INPUTS:
@@ -690,7 +698,7 @@ end
 % J_Nz
 if secOutputs.Nz
     Qz = model.x.penalty.weight + secOutputs.Kz'*model.u.penalty.weight*secOutputs.Kz;
-    if any(eig(Qz') <= 0), error('MPT+: Ups, penalty matrix Qz is not positive def!'); end
+    if any(eig(Qz') <= 0), error('MPTplus: Ups, penalty matrix Qz is not positive def!'); end
 
     for k = 1:secOutputs.Nz
         % Penalty
@@ -843,7 +851,7 @@ tic;
 Fs = W;
 for i = 1 : (Ns - 1)
     if size(Fs.V,1) > 2e5
-        input('\nMPT+: The tube is too complex! \nPress enter to continue or terminate the script.\n(Consider using "TubeType = implicit" instead of the "TubeType = explicit")')
+        input('\nMPTplus: The tube is too complex! \nPress enter to continue or terminate the script.\n(Consider using "TubeType = implicit" instead of the "TubeType = explicit")')
     end
     ShowProgress('Construction of an explicit tube...',i,Ns-1)
     Fs = Fs + Acl^(i)*W;
@@ -853,6 +861,9 @@ Tube = (1 - alpha)^(-1)*Fs;
 compTime = toc;
 % fprintf('...done! (computation time: %.2f, #iterations: %.0f, #halfspaces = %.0f)\n',compTime,s,size(Fs.H,1))
 fprintf('\b (computation time: %.2f, #iterations: %.0f, #halfspaces = %.0f)\n',compTime,Ns,size(Fs.H,1))
+
+% Normalize the tube:
+Tube = NormalizePolyhedron(Tube.minHRep);
 end
 
 
@@ -954,4 +965,542 @@ for i = 1:size(d,1)
     end
     f = [f; (1-alpha)^(-1)*suma_f];
 end
+end
+
+
+
+function [secOutputs] = PreProcessing_ElasticTube(model,secOutputs,options)
+% -------------------------------------------------------------------------
+%       [secOutputs] = PreProcessing_ElasticTube(model,secOutputs,options)
+% -------------------------------------------------------------------------
+% This function computes approximation parameters 
+% L - Global Elastic Tubes Dynamics (C*A*z + C*B*v + phi(sigma) + d <= C*z+ + a+)
+%     approximated by C*A*z + C*B*v + L*sigma + d <= C*z+ + a+
+% M - Global Elastic Tubes State Constraints (G*z + gamma(sigma) <= 1) 
+%     approximated by (G*z + M*sigma <= 1)
+% T - Global Elastic Tubes Control Constraints (H*v + ni(sigma) <= 1)
+%     approximated by (H*v + T*sigma <= 1)
+% where z are nominal states and v are nominal control inputs.      
+% -------------------------------------------------------------------------
+% INPUTS:
+%       model.A                 - system dynamics: x+ = A*x + B*u
+%       model.B                 - system dynamics: x+ = A*x + B*u
+%       model.x.penalty.weight  - state penalization
+%       model.u.penalty.weight  - input penalization
+%       secOutputs.K            - LQR policy
+%       secOutputs.Px           - state constraints (normalized), i.e.
+%                                      X := {x \in R^n | G*x <= 1}
+%       secOutputs.Pu           - input constraints (normalized), i.e.
+%                                      U := {u \in R^m | H*u <= 1}
+%       secOutputs.Pw           - disturbance constraints (normalized),i.e.
+%                                      W := {w \in R^n | D*w <= 1}
+%       options.qa              - weighting constant for sigma penalization
+%                                 (sigma is the optimized variable that 
+%                                  will modify the tube C*x <= 1 as: 
+%                                  C*x <= sigma)
+%       options.Kz              - terminal LQR gain
+%
+% OUTPUTS:
+%       L(1) \in R^{qs \times qs}_{>=0}, such that L*C = C*(A + B*K(sigma))
+%       M(1) \in R^{qx \times qs}_{>=0}, such that M*C = G
+%       T(1) \in R^{qu \times qs}_{>=0}, such that T*C = H*K(sigma)
+%       d = {d_i \in R | d_i = support(W,C_i), i = 1, ..., qs}
+%       gamma(1): R^{qs}_{>=0} -> R^{qx}_{>=0}
+%       ni(1): R^{qs}_{>=0} -> R^{qu}_{>=0}
+%       fi(1): R^{qs}_{>=0} -> R^{qs}_{>=0}
+%       Tset - terminal constraint
+%       Px_terminal - terminal state penalty
+%       Pa_terminal - terminal sigma penalty
+%       Qa          - penalization of the sigma variables
+%
+% Reference:
+% Sasa V.Rakovic, William S. Levine and Behcet Acikmese, Elastic Tube Model
+% Predictive Control, ACC 2016.
+
+% Notation Background:
+%       Inputs:
+%       system dynamics matrices model.A,model.B as: x+ = A*x + B*u
+%       X := {x \in R^n | G*x <= 1}
+%       U := {u \in R^m | H*u <= 1}
+%       W := {w \in R^n | D*w <= 1}
+%       S(sigma) := {sigma \in R^n | C*x <= sigma}
+%       K(sigma): R^{qs} -> R^{n \times m}
+%       Outputs:
+%       L \in R^{qs \times qs}_{>=0}, such that L*C = C*(A + B*K(sigma))
+%       M \in R^{qx \times qs}_{>=0}, such that M*C = G
+%       T \in R^{qu \times qs}_{>=0}, such that T*C = H*K(sigma)
+%       d = {d_i \in R | d_i = support(W,C_i), i = 1, ..., qs}
+%       gamma(1): R^{qs}_{>=0} -> R^{qx}_{>=0}
+%       ni(1): R^{qs}_{>=0} -> R^{qu}_{>=0}
+
+
+% To simplify notation
+X = secOutputs.Px;
+U = secOutputs.Pu;
+W = secOutputs.Pw;
+
+
+
+% -------------------------------------------------------------------------
+% Tube computation (Robust positive invariant set), 
+%               S(sigma) := {sigma \in R^n | C*x <= sigma}
+% -------------------------------------------------------------------------
+Sa = ConstructExplicitTube(model,secOutputs);
+if Sa.isEmptySet
+    error('Cannot continue as the minimal positive invariant set is empty!')
+end
+
+
+
+% -------------------------------------------------------------------------
+% Dimemnsions:
+% -------------------------------------------------------------------------
+% qs -> number of cons for the tube
+% qx -> number of cons for the state constraints X
+% qu -> number of cons for the input constraints U
+qs = size(Sa.A,1);
+qx = size(X.A,1);
+qu = size(U.A,1);
+
+% TODO: In this script we consider sigma to be static and equal to
+sigma = ones(qs,1);
+% TODO: make this as an optional parameter + make K funtion of the sigma
+%               K(sigma): R^{qs} -> R^{n \times m}
+Ka = @(sigma) secOutputs.K; 
+% TODO: assumption Kz == Klqr == K(1)
+if sum(sum(isnan(options.Kz)))
+    fprintf('MPTplus: terminal controller not provided, assuming LQR gain as the terminal controller ...\n')
+    Kz = Ka(sigma);
+else
+    Kz = options.Kz;
+end
+ 
+% TODO: Possibly make a flaxible penalization of each hyperplane?
+Qa = eye(size(Sa.A,1)) * options.qa; 
+
+
+% Evaluation of inputs:
+if options.Nz, warning('MPTplus: Ups, parameters Nz/Pz are not supported in elastic tube MPC. These parameters are omitted ... \n'); end
+
+
+% -------------------------------------------------------------------------
+% Global Elastic Tubes Dynamics: d (3.4)
+% -------------------------------------------------------------------------
+% Computation of d \in R^{qs}_{>=0} that represents "The biggest impact of 
+% disturbances from W to states", i.e.:
+% The tube is defiend as Z := {x \in R^n | C*x <= 1}. The disturbance 
+% w \in W := {w \in R^n | D*w <= 1} is directly injected to the state: 
+% x+ = A*x + B*u + w. From the Tube point of view this distrubance w will 
+% have following impact: C*(x + w) <= 1, hence C*x + C*w <= 1
+% 
+%       d_i = support(W,C_i)       i = 1, ..., qs
+%
+% MPT3: support(x) := max x'*y s.t. y in Set
+d = nan(qs,1);
+for k = 1:qs
+    d(k) = W.support(Sa.A(k,:)');
+end
+if any(isnan(d))
+    error('MPTplus: Ups, computation of vector d failed!')
+end
+
+
+
+% -------------------------------------------------------------------------
+% Global Elastic Tubes State Constraints:gamma (3.12)
+% -------------------------------------------------------------------------
+% gamma(sigma): R^{qs}_{>=0} -> R^{qx}_{>=0}
+
+gamma = nan(qx,1);
+for k = 1:qx
+    gamma(k) = Sa.support(X.A(k,:)');
+end
+if any(isnan(gamma))
+    error('MPTplus: Ups, computation of vector gamma failed!') 
+end
+
+
+
+% -------------------------------------------------------------------------
+% Global Elastic Tubes Control Constraints: ni (3.20)
+% -------------------------------------------------------------------------
+% n(sigma): R^{qs}_{>=0} -> R^{qu}_{>=0}
+
+KaSa = Ka(sigma)*Polyhedron('A', Sa.A, 'b', sigma);
+ni = nan(qu,1);
+for k = 1:qu
+    ni(k) = KaSa.support(U.A(k,:)');
+end
+if any(isnan(ni))
+    error('MPTplus: Ups, computation of vector ni failed!')
+end
+
+
+
+% -------------------------------------------------------------------------
+% M(1) computation
+% -------------------------------------------------------------------------
+% M \in R^{qx \times qs}_{>=0}
+
+obj = 0;
+con = [];
+M = sdpvar(qx,qs,'full');
+
+% Objective function
+% min sum_{i=1}^{qx} sum_j^{qs} M(i,j)^2  
+for k = 1:qx
+    for kk = 1:qs
+        obj = obj + M(k,kk)*M(k,kk);
+    end
+end
+
+% Constraints
+% M*1 = gamma(1)
+% M >= 0
+% M*C = G
+con = [con; M*ones(qs,1) == gamma];
+con = [con; M >= 0];
+con = [con; M*Sa.A == X.A];
+
+opt_settings = sdpsettings('verbose',0);
+
+DIAGNOSTIC = optimize(con,obj,opt_settings);
+if DIAGNOSTIC.problem ~= 0
+    error('MPTplus: Ups, cant calculate M(1) component!');
+end
+M_opt = double(M);
+
+
+
+% -------------------------------------------------------------------------
+% Computation of L(1)
+% -------------------------------------------------------------------------
+% L \in R^{qs \times qs}_{>=0}
+
+obj = 0;
+con = [];
+L = sdpvar(qs,qs,'full');
+
+% Objective function
+% min sum_{i=1}^{qs} sum_j^{qs} L(i,j)^2  
+for k = 1:qs
+    for kk = 1:qs
+        obj = obj + L(k,kk)*L(k,kk);
+    end
+end
+
+% Constraints
+con = [con; L*ones(qs,1) == ones(qs,1) - d];
+con = [con; L >= 0];
+con = [con; L*Sa.A == Sa.A*(model.A + model.B*Ka(sigma))];
+
+opt_settings = sdpsettings('verbose',0);
+
+DIAGNOSTIC = optimize(con,obj,opt_settings);
+if DIAGNOSTIC.problem ~= 0
+    error('MPTplus: Ups, cant calculate L(1) component!');
+end
+L_opt = double(L);
+
+
+
+% -------------------------------------------------------------------------
+% Computation of T(1)
+% -------------------------------------------------------------------------
+% T \in R^{qu \times qs}_{>=0}
+
+obj = 0;
+con = [];
+T = sdpvar(qu,qs,'full');
+
+% Objective function
+% min sum_{i=1}^{qu} sum_j^{qs} T(i,j)^2  
+for k = 1:qu
+    for kk = 1:qs
+        obj = obj + T(k,kk)*T(k,kk);
+    end
+end
+
+% Constraints
+con = [con; T*ones(qs,1) == ni];
+con = [con; T >= 0];
+con = [con; T*Sa.A == U.A*Ka(sigma)];
+
+opt_settings = sdpsettings('verbose',0);
+
+DIAGNOSTIC = optimize(con,obj,opt_settings);
+if DIAGNOSTIC.problem ~= 0
+    error('MPTplus: Ups, cant calculate T(1) component!');
+end
+T_opt = double(T);
+
+
+
+% -------------------------------------------------------------------------
+% Terminal set Tset
+% -------------------------------------------------------------------------
+% Tset := {(z,a) \in R^{n+qs} | -a <= 0, G*z + M1*a <= 1, H*Kz*z + T1*a <= 1}
+
+%               -a <= 0
+%       G*z + M1*a <= 1
+%    H*Kz*z + T1*a <= 1
+% ---------------------------
+% H*[z a] <= h
+H = [zeros(qs,size(model.A,1)) -eye(qs);
+    X.A M_opt;
+    U.A*Kz T_opt];
+h = [zeros(qs,1);ones(qx,1);ones(qu,1)];
+
+% Setup dynamics:
+% z+ = (A + B*Kz)*z
+% a+ = L1*a + d
+% ------------------
+% [z+; a+] = [(A + B*Kz) 0; 0 L1] [z; a] + [0;d]
+
+
+nx = size(model.A,2);
+AA = [(model.A + model.B*Kz) zeros(nx,qs); zeros(qs,nx) L_opt];
+BB = [zeros(nx,1); d];
+model_inv_set = LTISystem('A', AA, 'f', BB);
+model_inv_set.x.with('setConstraint');
+model_inv_set.x.setConstraint = Polyhedron('A',H, 'b', h);
+Tset = model_inv_set.invariantSet();
+
+
+
+% -------------------------------------------------------------------------
+% Terminal penalty
+% -------------------------------------------------------------------------
+if all(eig(L_opt) < 1)
+    if all(eig(model.A + model.B*Kz) < 1)
+        obj = 0;
+        con = [];
+        Pz = sdpvar(nx);
+        Pa = sdpvar(qs);
+
+        Qx = model.x.penalty.weight;
+        Qu = model.u.penalty.weight;
+
+        con = [con, (model.A + model.B*Kz)'*Pz*(model.A + model.B*Kz) - ...
+            Pz <= -(Qx + Kz'*Qu*Kz)];
+        con = [con, L_opt'*Pa*L_opt - Pa <= -Qa];
+
+        opt_settings = sdpsettings('verbose',0);
+        DIAGNOSTIC = optimize(con,obj,opt_settings);
+        if DIAGNOSTIC.problem ~= 0
+            error('MPTplus: Ups, cant calculate terminal penalties Pz and Pa!');
+        end
+        Px_terminal = double(Pz);
+        Pa_terminal = double(Pa);
+    else
+        error('MPTplus: Ups, unstabilizing terminal controller Kz was selected!')
+    end
+else
+    error('MPTplus: Ups, computed L(1) matrix is wrong!')
+end
+
+
+
+% -------------------------------------------------------------------------
+% Outputs
+% -------------------------------------------------------------------------
+elasticparams.L1 = L_opt;
+elasticparams.M1 = M_opt;
+elasticparams.T1 = T_opt;
+elasticparams.d = d;
+elasticparams.gamma1 = gamma;
+elasticparams.ni1 = ni;
+elasticparams.fi1 = 1 - d;
+elasticparams.qs = qs;
+elasticparams.qx = qx;
+elasticparams.qu = qu;
+elasticparams.sigma = sigma;
+elasticparams.Tset = Tset;
+elasticparams.Px_terminal = Px_terminal;
+elasticparams.Pa_terminal = Pa_terminal;
+elasticparams.Qa = Qa;
+elasticparams.Ka = Ka;
+secOutputs.Tube = Sa;
+secOutputs.Px_robust = {};
+secOutputs.Pu_robust = {};
+secOutputs.elasticparams = elasticparams;
+
+end
+
+
+
+function [secOutputs] = DefineMPCProblem_ElasticTube(model,secOutputs,options)
+% Function defines optimization problem of an MPC policy
+%
+% INPUTS:
+%     secOutputs.N          - Prediction horizon
+%     secOutputs.Px         - original state consraint
+%     secOutputs.Tube       - minimal robust invariant set
+%     secOutputs.Px_robust  - robustustified state constraint
+%     secOutputs.Pu_robust  - robustustified input constraint
+%     secOutputs.Pdu        - delta-u constraints
+%     secOutputs.K          - LQR gain (u = K*x)
+%     model                 - defined model as MPT3 object
+%     options.LQRstability  - {0} Compute the terminal penalty/set w.r.t.
+%                             the ULTI system (given in 'model')
+%                             {1} Compute the terminal penalty/set w.r.t.
+%                             the LTI system (not the ULTI as in 'model')
+%     options.forceRigidTubeInETMPC  - forces rigit tube (i.e. not elastic)
+%     secOutputs.elasticparams - all precomputed elastic parameters (see 
+%                                ComputeElasticParams)
+%
+% OUTPUTS:
+% secOutputs.OptimProblem.MPCproblem                 - optimisation problem (mpt3)
+% secOutputs.OptimProblem.Constraints                - opt constraints (YALMIP)
+% secOutputs.OptimProblem.Objective                  - opt objective function (YALMIP)
+% secOutputs.OptimProblem.Param_Required             - opt required parameters (YALMIP)
+% secOutputs.OptimProblem.Param_Returned             - opt returned parameters (YALMIP)
+% secOutputs.OptimProblem.CompactForm_Param_Returned - opt required parameters (YALMIP)
+% secOutputs.OptimProblem.ExactForm_Param_Returned   - opt returned parameters (YALMIP)
+% secOutputs.OptimProblem.YALMIP_settings            - opt settings (YALMIP)
+% secOutputs.OptimProblem.options                    - tube MPC options
+% secOutputs.OptimProblem.MPCoptimizers.implicit     - optimizer that retuns
+%                                                      Utube = u_opt +
+%                                                      + K*(x-x_opt) (YALMIP)
+% secOutputs.OptimProblem.MPCoptimizers.explicit     - optimizer that retuns
+%                                                      [u_opt, x_opt]  (YALMIP)
+
+
+% TODO:
+% !!! in the RHC is used "secOutputs.K" (not secOutputs.elasticparams.Ka)
+% !!! Kz/Pz is not impleemnted 
+
+
+
+% Determine MPC formulations that were given by the user
+MPCforms = DeterminTEMPCFormulations(model);
+
+
+% Define decision variables - YALMIP variables
+X0 = sdpvar(model.nx,1);
+u = sdpvar(model.nu,secOutputs.N,'full');
+x = sdpvar(model.nx,secOutputs.N+1+secOutputs.Nz,'full');
+sigma = sdpvar(secOutputs.elasticparams.qs,secOutputs.N+1+secOutputs.Nz,'full');
+
+
+% Initialize constraints and objective function
+con = [];
+obj = 0;
+
+% ------------------------------ Constraints ------------------------------
+% We consider following constraints:
+%  		 X0 \in X                       <- this is not needed (only imposes infeasibility)
+% 		(X0 - x(:,1)) \in S(sigma(:,1))
+%       
+% 		-sigma(:,k) <= 0                                for k = 1, ..., N
+%       C*A*z(:,k) + C*B*v(:,k) + L(1)*sigma(:,k) + 
+%       + d - C*z(:,k+1) - sigma(:,k+1) <= 0            for k = 1, ..., N
+%       G*z(:,k) + M(1)*sigma(:,k) - 1 <= 0             for k = 1, ..., N
+%       H*v(:,k) + T(1)*sigma(:,k) - 1 <= 0             for k = 1, ..., N
+%       Fz*z(:,N+1) + Fa*sigma(:,N+1) - Fa*1 - 1 <= 0
+%
+%       TODO: implement constraints also for Kz > 0
+
+C = secOutputs.Tube.A; % we consider that the tube is normalized 
+
+con = [con, C*X0 - C*x(:,1) - sigma(:,1) <= 0];
+for k = 1:secOutputs.N
+    con = [con, -sigma(:,k) <= 0];
+    % Global elastic tube dynamics
+    con = [con, C*model.A*x(:,k) + C*model.B*u(:,k) + secOutputs.elasticparams.L1*sigma(:,k) + ...
+           + secOutputs.elasticparams.d - C*x(:,k+1) - sigma(:,k+1) <= 0];
+    % Global elasetic tube state constraints
+    con = [con, secOutputs.Px.A*x(:,k) + secOutputs.elasticparams.M1*sigma(:,k) - 1 <= 0];
+    % Global elasetic tube input constraints
+    con = [con, secOutputs.Pu.A*u(:,k) + secOutputs.elasticparams.T1*sigma(:,k) - 1 <= 0];
+end
+
+% Delta-U constraints
+if MPCforms.deltaucon
+    uprev = sdpvar(model.nu,1,'full');
+    Pdu = secOutputs.Pdu;
+    for k = 1:secOutputs.N
+        if k == 1
+            con = [con, secOutputs.Pu.A*(u(:,k) - uprev) + secOutputs.elasticparams.T1*sigma(:,k) - 1 <= 0];
+        else
+            con = [con, secOutputs.Pu.A*(u(:,k) - u(:,k-1)) + secOutputs.elasticparams.T1*sigma(:,k) - 1 <= 0];
+        end
+    end
+end
+
+% TODO: remove this option
+if options.forceRigidTubeInETMPC
+    for k = 1:secOutputs.N+1
+        con = [con, sigma(:,k) == ones(size(sigma(:,k)))];
+    end
+end
+
+
+% ------------------------------- Objective -------------------------------
+% Consider a stage cost:
+%       el(z,v,sigma) = z'*Qz*z + v'*Qv*v + (sigma - 1)'*Qa*(sigma - 1)
+% and terminal cost:
+%       Vf(z,sigma) = z'*Pz*z + (sigma - 1)'*Pa*(sigma - 1)
+% then the overall objective function is given by:
+% J(z,v,sigma) = Vf(z(:,N+1),sigma(:,N+1)) + \sum_{k=1}^{N} el(z(:,k),v(:,k),sigma(:,k))
+
+Q = model.x.penalty.weight;
+R = model.u.penalty.weight;
+Qa = secOutputs.elasticparams.Qa;
+for k = 1:secOutputs.N
+    obj = obj + x(:,k)'*Q*x(:,k) + u(:,k)'*R*u(:,k) + (1 - sigma(:,k))'*Qa*(1 - sigma(:,k));
+end
+
+
+
+% --------------------------- Terminal obj/cons ---------------------------
+% TODO: let user to force his-her terminal parameters
+
+if options.LQRstability
+    model = ComputeLQRSet(model);
+end
+
+% Terminal constraints
+if isprop(model.x,'terminalSet')
+    A = secOutputs.elasticparams.Tset.A;
+    b = secOutputs.elasticparams.Tset.b;
+    con = [con, A*[x(:,end); sigma(:,end)] <= b];
+end
+
+% Terminal penalty
+if isprop(model.x,'terminalPenalty')
+    Pt = secOutputs.elasticparams.Px_terminal;
+    Pa = secOutputs.elasticparams.Pa_terminal;
+    N = secOutputs.N;
+    obj = obj + x(:,N+1)'*Pt*x(:,N+1) + (1 - sigma(:,N+1))'*Pa*(1 - sigma(:,N+1));
+end
+
+
+% ---------------------------- MPC definition -----------------------------
+% Optimization settings - silent verbose mode
+opt_settings = sdpsettings('verbose',0);
+
+p_required = X0;
+if any([MPCforms.deltaucon,MPCforms.deltaupen])
+    p_required = [p_required; uprev];
+end
+
+% Note that the TEMPC will have always p_return = [u(:,1); x(:,1)].
+% If required, by solType ==1, then this primal function will be
+% overwritten inside of the .toExplicit function
+OptimProblem.options = options;
+OptimProblem.MPCforms = MPCforms;
+OptimProblem.MPCproblem = Opt(con, obj, p_required, ...
+    [u(:,1); x(:,1); sigma(:,1)]);
+% construct compact/exact optimizers
+% OptimProblem.MPCoptimizers.compact = optimizer(con, obj, opt_settings, ...
+%     p_required, [obj(:); u(:,1) + secOutputs.K*( X0 - x(:,1))]);
+OptimProblem.MPCoptimizers.compact = optimizer(con, obj, opt_settings, ...
+    p_required, [obj(:); u(:,1) + secOutputs.elasticparams.Ka(sigma(:,1))*( X0 - x(:,1))]);
+% OptimProblem.MPCoptimizers.exact = optimizer(con, obj, opt_settings, ...
+%     p_required, [obj(:); u(:); x(:)]);
+OptimProblem.MPCoptimizers.exact = optimizer(con, obj, opt_settings, ...
+    p_required, [obj(:); u(:); x(:); sigma(:)]);
+% Save all results
+secOutputs.OptimProblem = OptimProblem;
 end

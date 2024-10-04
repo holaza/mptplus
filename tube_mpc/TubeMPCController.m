@@ -152,14 +152,38 @@ classdef TubeMPCController < MPCController
                     % Return compact control law: u(t) = u0 + K*(x(t) - x0)
                     u = U(2 : obj.TMPCparams.nu+1);
                 elseif ( solType == 0 )
-                    % Return exact control law: [u0, x0]
+                    switch obj.TMPCparams.OptimProblem.options.TubeType
+                        case {'explicit','implicit'}
+                            % Return exact control law: [u0, x0]
 
-                    % U_exact = reshape( U(2 : nu*N + 1 ), [nu, N] )
-                    U_exact = reshape ( U( 2 : obj.TMPCparams.nu*obj.TMPCparams.N + 1 ), [ obj.TMPCparams.nu, obj.TMPCparams.N ] );
+                            % U_exact = reshape( U(2 : nu*N + 1 ), [nu, N] )
+                            U_exact = reshape ( U( 2 : obj.TMPCparams.nu*obj.TMPCparams.N + 1 ), [ obj.TMPCparams.nu, obj.TMPCparams.N ] );
 
-                    % X_exact = reshape( U(nu*N + 2 : end), [nx, N+1] )
-                    X_exact = reshape ( U( obj.TMPCparams.nu*obj.TMPCparams.N + 2 : end) , [ obj.TMPCparams.nx, obj.TMPCparams.N+1 ] );
-                    u = [ U_exact( : , 1 ); X_exact( : , 1 ) ]; % return 1st contol step: [u0, x0]
+                            % X_exact = reshape( U(nu*N + 2 : end), [nx, N+1] )
+                            X_exact = reshape ( U( obj.TMPCparams.nu*obj.TMPCparams.N + 2 : end) , [ obj.TMPCparams.nx, obj.TMPCparams.N+1 ] );
+                            u = [ U_exact( : , 1 ); X_exact( : , 1 ) ]; % return 1st contol step: [u0, x0]
+                        case 'elastic'
+                            % Return exact control law: [u0, x0, sigma0]
+
+                            % U_exact = reshape( U(2 : nu*N + 1 ), [nu, N] )
+                            start = 2;
+                            fin = start + obj.TMPCparams.nu*obj.TMPCparams.N - 1;
+                            U_exact = reshape ( U( start : fin ), [ obj.TMPCparams.nu, obj.TMPCparams.N ] );
+
+                            % X_exact = reshape( U(nu*N + 2 : nu*N + 2 + nx*(N+1) - 1), [nx, N+1] )
+                            start = fin + 1;
+                            fin = start + obj.TMPCparams.nx*(obj.TMPCparams.N + 1) -1;
+                            X_exact = reshape ( U( start : fin) , [ obj.TMPCparams.nx, obj.TMPCparams.N+1 ] );
+                            
+                            % sigma_exact = reshape( U(nu*N + 2 + nx*(N+1) : nu*N + 2 + nx*(N+1) + qs*N  - 1), [qs, N] )
+                            start = fin + 1;
+                            fin = start + obj.TMPCparams.elasticparams.qs*(obj.TMPCparams.N) - 1;
+                            sigma_exact = reshape ( U( start : fin) , [ obj.TMPCparams.elasticparams.qs, obj.TMPCparams.N ] );
+                            
+                            u = [ U_exact( : , 1 ); X_exact( : , 1 ); sigma_exact(:,1) ]; % return 1st contol step: [u0, x0, sigma0]
+                        otherwise
+                            error('MPTplus: Incorrect TubeType found during control action evaluation!')
+                    end
                 else
                     error(sprintf('MPTplus: Unexpected value of solType: %d',solType))
                 end
@@ -174,12 +198,25 @@ classdef TubeMPCController < MPCController
                     openloop.Y = NaN;
                     openloop.info = 'OPENLOOP evaluation of Tube MPC is under cosntruction.';
                 elseif ( solType == 0 )
-                    % U' = [ cost, [u(0)',...,u(N-1)'], [x(0)',...,x(N)'] ]
-                    openloop.cost = J;
-                    openloop.U = reshape( U( 2:( obj.TMPCparams.N * obj.TMPCparams.nu )+1) , [ obj.TMPCparams.nu, obj.TMPCparams.N ] );
-                    openloop.X = reshape( U( ( obj.TMPCparams.N * obj.TMPCparams.nu )+2 : end ) , [ obj.TMPCparams.nx, obj.TMPCparams.N+1 ] );
-                    openloop.Y = NaN;
-                    openloop.info = 'OPENLOOP evaluation of Tube MPC is under cosntruction.';
+                    switch obj.TMPCparams.OptimProblem.options.TubeType
+                        case {'explicit','implicit'}
+                            % U' = [ cost, [u(0)',...,u(N-1)'], [x(0)',...,x(N)'] ]
+                            openloop.cost = J;
+                            openloop.U = U_exact;
+                            openloop.X = X_exact;
+                            openloop.Y = NaN;
+                            openloop.info = 'OPENLOOP evaluation of Tube MPC is under cosntruction.';
+                        case 'elastic'
+                            % U' = [ cost, [u(0)',...,u(N-1)'], [x(0)',...,x(N)'], [sigma(0),...,sigma(N-1)] ]
+                            openloop.cost = J;
+                            openloop.U = U_exact;
+                            openloop.X = X_exact;
+                            openloop.sigma = sigma_exact;
+                            openloop.Y = NaN;
+                            openloop.info = 'OPENLOOP evaluation of Tube MPC is under cosntruction.';
+                        otherwise
+                            error('MPTplus: Incorrect TubeType found during control action evaluation!')
+                    end
                 else
                     error(sprintf('MPTplus: Unexpected value of solType: %d',solType))
                 end
@@ -198,6 +235,7 @@ classdef TubeMPCController < MPCController
             % Check type (solType) of Tube MPC controller: "u_tube" vs "[u0, x0]"
             solType = obj.TMPCparams.OptimProblem.options.solType;
             if ( solType == 0 )
+                tubeType = obj.TMPCparams.OptimProblem.options.TubeType;
                 % Parse inputs
                 mpc = obj;
                 % Extract parameters
@@ -225,6 +263,7 @@ classdef TubeMPCController < MPCController
                 Xnominal = [ xinit ]; % initial nominal system states
                 Udata = []; % initial closed-loop control action
                 Xdata = [ X ]; % initial closed-loop system states
+                if strcmpi(tubeType,'elastic'), SIGMAnominal = []; end
                 cost = 0;
                 for k = 1 : Nsim
                     % Current system states
@@ -235,23 +274,50 @@ classdef TubeMPCController < MPCController
                     U_opt = UX_opt(1:nu);
                     X_opt = UX_opt(nu+1 : nu+nx);
                     Utube = U_opt + K*( X - X_opt );
+                    if strcmpi(tubeType,'elastic') 
+                        Sigma = UX_opt(nu+nx+1:nu+nx + mpc.TMPCparams.elasticparams.qs); 
+                        Utube = U_opt + mpc.TMPCparams.elasticparams.Ka(Sigma)*( X - X_opt );
+                    end
                     % Uncertain (noisy) LTI system: X(k+1) = A*X(k) + B*U(k)
                     Xdata(:,k+1) = A*X + B*( Utube ) + w(:,k);
                     % Output data
                     Unominal = [Unominal, U_opt];
                     Xnominal = [Xnominal, X_opt];
                     Udata = [Udata, Utube];
+                    if strcmpi(tubeType,'elastic')
+                        SIGMAnominal = [SIGMAnominal,Sigma]; 
+                    end
                     cost = cost + X'*Q*X + Utube'*R*Utube; % Quadratic cost
                 end
                 % Assign outputs
                 ClosedLoopData.U = Udata;
                 ClosedLoopData.X = Xdata;
+                ClosedLoopData.W = w;
                 ClosedLoopData.cost = cost;
                 ClosedLoopData.Unominal = Unominal;
                 ClosedLoopData.Xnominal = Xnominal;
                 ClosedLoopData.K = K;
+                if strcmpi(tubeType,'elastic') 
+                    ClosedLoopData.K = mpc.TMPCparams.elasticparams.Ka();
+                    ClosedLoopData.SIGMAnominal = SIGMAnominal; 
+                end
             else
+                %% if ( solType == 1 ) 
                 [ ClosedLoopData ] = obj.simulate@MPCController(xinit, Nsim, varargin{:});
+                
+                % Overwrite original MPT3 "cost" (NaN) with the closed loop cost 
+                cost = 0;
+                Q = obj.model.x.penalty.H;
+                R = obj.model.u.penalty.H;
+                for k = 1 : Nsim
+                    % Current system states
+                    X = ClosedLoopData.X(:,k);
+                    % Current control action
+                    U = ClosedLoopData.U(:,k);
+                    cost = cost + X'*Q*X + U'*R*U; % Quadratic cost
+                end
+                ClosedLoopData.cost = cost; 
+
             end % if ( solType == 0 )
         end % function
     end
