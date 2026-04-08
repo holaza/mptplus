@@ -26,9 +26,10 @@ function TMPC = TMPCController(model,N,option)
 %     LQRstability          - {0} Does not compute any terminal penalty/set
 %                             {1} Computes the terminal penalty/set w.r.t.
 %                                 the LTI system (not the ULTI system)
-%     TubeType              - {'implicit', 'explicit'} Type of the tube 
-%                             embedded in the optimization problem. By
-%                             default, TubeType = 'explicit'.
+%     TubeType              - {'implicit', 'explicit','elastic',
+%                              'timevarying'} Type of the tube embedded in 
+%                             the optimization problem. By default, 
+%                             TubeType = 'explicit'.
 %     Nz                    - number of terminal steps. By default, Nz = 0.
 %                             (i.e. prediction steps with control actions 
 %                              computed as u_k = Kz*x, where Kz is also 
@@ -87,7 +88,7 @@ validScalarPosNum = @(x) isnumeric(x) && isscalar(x) && (x > 0);
 validScalar = @(x) isnumeric(x) && isscalar(x) && (x >= 0);
 isBinary = @(x) ismember(x,[0 1]);
 isValidMatrix = @(x) all([all(~isnan(x(:))),all(isnumeric(x(:)))]);
-isValidTubeType = @(x) any(strcmpi(x,{'explicit','implicit','elastic'}));
+isValidTubeType = @(x) any(strcmpi(x,{'explicit','implicit','elastic','timevarying'}));
 
 % set options/default values
 ip = inputParser;
@@ -105,6 +106,9 @@ ip.addParameter('qa', 1e0, validScalarPosNum);                  % Elastic TMPC
 ip.addParameter('forceRigidTubeInETMPC', 0, isBinary);          % Elastic TMPC
 if nargin == 3, ip.parse(option{:}); else ip.parse(); end
 options = ip.Results;
+
+%% Check if the user selected feasible MPC setup
+CheckFeasibleSetup(model,options)
 
 %% TMPC setup
 % copy model to do not alter the original object
@@ -127,6 +131,10 @@ elseif strcmpi(options.TubeType,'explicit')
 elseif strcmpi(options.TubeType,'elastic')
     secOutputs = PreProcessing_ElasticTube(workingModel,secOutputs,options);
     secOutputs = DefineMPCProblem_ElasticTube(workingModel,secOutputs,options);
+elseif strcmpi(options.TubeType,'timevarying')
+%     https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=10694700
+    secOutputs = PreProcessing_TimeVaryingTube(workingModel,secOutputs);
+    secOutputs = DefineMPCProblem_TimeVaryingTube(workingModel,secOutputs,options);
 end
 
 %% Construction of MPC
@@ -370,6 +378,45 @@ end
 
 
 
+function [secOutputs] = PreProcessing_TimeVaryingTube(model,secOutputs)
+% Function preprocess variables for further processing.
+%
+% INPUTS:
+%           model                   - model of the system (as MPT3 object)
+%           secOutputs.K            - LQR gain
+%           secOutputs.Pw           - Bounded additive uncertainty
+%           secOutputs.Px           - state constraints 
+%           secOutputs.Pu           - input constraints
+%           secOutputs.N            - Prediction horizon
+% OUTPUTS:
+%           secOutputs.params_TVTMPC.Xf - maximal robust positive invariant set
+
+
+
+% Checks of supported functionalities:
+if secOutputs.Nz
+    error(['MPTplus: We are sorry, but multiple terminal steps Nz' ... 
+        'are not supported in the timevarying tube MPC formulation.']);
+end
+% if any([isprop(model.u,'deltaMin'), isprop(model.u,'deltaMax')])
+%     error('MPTplus: Ups, delta constraints are not supported!')
+% end
+
+
+% Robust positive invariant set
+% Xf = maximal_robust_invariant_set(model,secOutputs);
+out = compute_maximal_positive_invariant_set(model, secOutputs);
+Xf = out.R_max;
+if Xf.isEmptySet
+    error('Cannot continue as the minimal positive invariant set is empty!')
+end
+
+% Store all computed
+secOutputs.params_TVTMPC.Xf = Xf;
+end
+
+
+
 
 function [secOutputs] = PreProcessing_ExplicitTube(model,secOutputs)
 % Function preprocess variables for further processing.
@@ -466,20 +513,31 @@ for k = 1:secOutputs.N
     con = [con, secOutputs.Pxu.A*[x(:,k);u(:,k)] <= secOutputs.Pxu.b - secOutputs.f];
 end
 
+% % Delta-U constraints
+% if MPCforms.deltaucon
+%     uprev = sdpvar(model.nu,1,'full');
+%     Pdu = secOutputs.Pdu;
+%     fu = secOutputs.f(end-size(Pdu.A,1)+1:end);
+%     for k = 1:secOutputs.N
+%         if k == 1
+%             con = [con, Pdu.A*(u(:,k) - uprev) <= Pdu.b - fu];
+%         else
+%             con = [con, Pdu.A*(u(:,k) - u(:,k-1)) <= Pdu.b - fu];
+%         end
+%     end
+% end
 % Delta-U constraints
 if MPCforms.deltaucon
     uprev = sdpvar(model.nu,1,'full');
     Pdu = secOutputs.Pdu;
-    fu = secOutputs.f(end-size(secOutputs.Pu.A,1)+1:end);
     for k = 1:secOutputs.N
         if k == 1
-            con = [con, secOutputs.Pu.A*(u(:,k) - uprev) <= secOutputs.Pu.b - fu];
+            con = [con, Pdu.A*(u(:,k) - uprev) <= Pdu.b];
         else
-            con = [con, secOutputs.Pu.A*(u(:,k) - u(:,k-1)) <= secOutputs.Pu.b - fu];
+            con = [con, Pdu.A*(u(:,k) - u(:,k-1)) <= Pdu.b];
         end
     end
 end
-
 
 
 % ------------------------------ Objective --------------------------------
@@ -573,6 +631,7 @@ OptimProblem.MPCoptimizers.exact = optimizer(con, obj, opt_settings, ...
 % Save all results
 secOutputs.OptimProblem = OptimProblem;
 end
+
 
 
 function [secOutputs] = DefineMPCProblem_ExplicitTube(model,secOutputs,options)
@@ -873,6 +932,8 @@ form.deltaucon = 0;
 form.deltaupen = 0;
 form.ytrack = 0;
 form.xtrack = 0;
+form.xterminalPenalty = 0;
+form.ublock = 0;
 
 if  any([isprop(model.u,'deltaMin'),isprop(model.u,'deltaMax')])
     form.deltaucon = 1;
@@ -892,6 +953,14 @@ end
 if isprop(model.y,'reference')
     form.ytrack = 1;
     error('MPTplus does not support Tube MPC for output reference tracking problem, yet.')
+end
+
+if isprop(model.x,'terminalPenalty')
+    form.xterminalPenalty = 1;
+end
+
+if isprop(model.u,'block')
+    form.ublock = 1;
 end
 end
 
@@ -1415,15 +1484,27 @@ for k = 1:secOutputs.N
     con = [con, secOutputs.Pu.A*u(:,k) + secOutputs.elasticparams.T1*sigma(:,k) - 1 <= 0];
 end
 
+% % Delta-U constraints
+% if MPCforms.deltaucon
+%     uprev = sdpvar(model.nu,1,'full');
+%     Pdu = secOutputs.Pdu;
+%     for k = 1:secOutputs.N
+%         if k == 1
+%             con = [con, Pdu.A*(u(:,k) - uprev) + secOutputs.elasticparams.T1*sigma(:,k) - 1 <= 0];
+%         else
+%             con = [con, Pdu.A*(u(:,k) - u(:,k-1)) + secOutputs.elasticparams.T1*sigma(:,k) - 1 <= 0];
+%         end
+%     end
+% end
 % Delta-U constraints
 if MPCforms.deltaucon
     uprev = sdpvar(model.nu,1,'full');
     Pdu = secOutputs.Pdu;
     for k = 1:secOutputs.N
         if k == 1
-            con = [con, secOutputs.Pu.A*(u(:,k) - uprev) + secOutputs.elasticparams.T1*sigma(:,k) - 1 <= 0];
+            con = [con, Pdu.A*(u(:,k) - uprev)  <= Pdu.b];
         else
-            con = [con, secOutputs.Pu.A*(u(:,k) - u(:,k-1)) + secOutputs.elasticparams.T1*sigma(:,k) - 1 <= 0];
+            con = [con, Pdu.A*(u(:,k) - u(:,k-1)) <= Pdu.b];
         end
     end
 end
@@ -1504,3 +1585,671 @@ OptimProblem.MPCoptimizers.exact = optimizer(con, obj, opt_settings, ...
 % Save all results
 secOutputs.OptimProblem = OptimProblem;
 end
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%  Supporting functions for  PreProcessing_TimeVaryingTube %%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function out = compute_maximal_positive_invariant_set(model, secOutputs, opts)
+% compute_invariant_sets
+%
+% System:
+%   x+ = A x + B u + w
+%   u  = K x
+%
+% Returns:
+%   out.LQR_region_max   - maximal nominal invariant set for x+ = (A+B*K)x
+%                          subject to x in X and Kx in U
+%   out.R_max            - maximal robust positively invariant set for
+%                          x+ = (A+B*K)x + w, w in W
+%                          subject to x in X and Kx in U
+%   out.R_min_outer      - epsilon-outer approximation of minimal RPI set
+%   out.X_admissible_cl  - X ∩ {x | Kx ∈ U}
+%
+% Inputs:
+%   X, U, W must be MPT3 Polyhedron objects.
+%
+% Notes:
+%   - This implementation intentionally avoids minHRep(), because that can
+%     trigger LP-based simplification routines in MPT3 and fail depending
+%     on the LP backend.
+%   - The minimal RPI set is returned as an epsilon-outer approximation.
+%
+% Required:
+%   - MPT3
+%   - YALMIP
+%
+% Optional:
+%   - LP solver for YALMIP verification
+
+    if nargin < 3
+        opts = struct();
+    end
+    opts = set_default_opts(opts);
+
+    % Extract inputs
+    A = model.A;
+    B = model.B;
+    K = secOutputs.K;
+    U = secOutputs.Pu;
+    X = secOutputs.Px;
+    W = secOutputs.Pw;
+
+    % ------------------------------------------------------------
+    % Dimensions and basic checks
+    % ------------------------------------------------------------
+    nx = size(A,1);
+    nu = size(B,2);
+
+    assert(size(A,2) == nx, 'A must be square.');
+    assert(size(B,1) == nx, 'A and B dimensions are inconsistent.');
+    assert(all(size(K) == [nu, nx]), 'K must be of size nu-by-nx.');
+
+    assert(isa(X, 'Polyhedron'), 'X must be a Polyhedron.');
+    assert(isa(U, 'Polyhedron'), 'U must be a Polyhedron.');
+    assert(isa(W, 'Polyhedron'), 'W must be a Polyhedron.');
+
+    assert(X.Dim == nx, 'X has wrong dimension.');
+    assert(U.Dim == nu, 'U has wrong dimension.');
+    assert(W.Dim == nx, 'W has wrong dimension.');
+
+    assert(~X.isEmptySet(), 'X is empty.');
+    assert(~U.isEmptySet(), 'U is empty.');
+    assert(~W.isEmptySet(), 'W is empty.');
+
+    assert(X.isBounded(), 'X must be bounded.');
+    assert(U.isBounded(), 'U must be bounded.');
+    assert(W.isBounded(), 'W must be bounded.');
+
+    if ~W.contains(zeros(nx,1))
+        error('This implementation assumes 0 ∈ W.');
+    end
+
+    Acl = A + B*K;
+
+    % ------------------------------------------------------------
+    % Admissible closed-loop state set:
+    %   Xad = {x | x ∈ X, Kx ∈ U}
+    % ------------------------------------------------------------
+    U_pre_K = poly_preimage(U, K);
+    Xad = X & U_pre_K;
+
+    if Xad.isEmptySet()
+        warning('The admissible closed-loop set X ∩ {x | Kx ∈ U} is empty.');
+    end
+
+    % ------------------------------------------------------------
+    % 2) Maximal robust positively invariant set under fixed K
+    % ------------------------------------------------------------
+    [R_max, max_rpi_info] = maximal_rpi_fixed_feedback(Acl, Xad, W, opts);
+
+    % ------------------------------------------------------------
+    % Optional verification with YALMIP
+    % ------------------------------------------------------------
+    verification = struct();
+
+    if opts.verifyWithYALMIP
+        verification.R_max_invariant = verify_rpi_yalmip(R_max, Acl, W, opts);
+        verification.R_max_admissible = poly_contains_poly(Xad, R_max, opts.tol);
+    end
+
+    out = struct();
+    out.R_max            = R_max;
+    out.X_admissible_cl  = Xad;
+
+    out.info = struct();
+    out.info.Acl = Acl;
+    out.info.max_rpi = max_rpi_info;
+    out.info.verification = verification;
+end
+
+% =========================================================================
+% OPTIONS
+% =========================================================================
+function opts = set_default_opts(opts)
+    if ~isfield(opts, 'maxIterLQR'),       opts.maxIterLQR = 500; end
+    if ~isfield(opts, 'maxIterMaxRPI'),    opts.maxIterMaxRPI = 500; end
+    if ~isfield(opts, 'maxIterMinRPI'),    opts.maxIterMinRPI = 1000; end
+    if ~isfield(opts, 'epsMRPI'),          opts.epsMRPI = 1e-3; end
+    if ~isfield(opts, 'tol'),              opts.tol = 1e-8; end
+    if ~isfield(opts, 'verifyWithYALMIP'), opts.verifyWithYALMIP = true; end
+    if ~isfield(opts, 'solver'),           opts.solver = ''; end
+
+    assert(opts.maxIterLQR >= 1, 'opts.maxIterLQR must be >= 1.');
+    assert(opts.maxIterMaxRPI >= 1, 'opts.maxIterMaxRPI must be >= 1.');
+    assert(opts.maxIterMinRPI >= 1, 'opts.maxIterMinRPI must be >= 1.');
+    assert(opts.epsMRPI > 0 && opts.epsMRPI < 1, 'opts.epsMRPI must be in (0,1).');
+end
+
+% =========================================================================
+% PREIMAGE UNDER LINEAR MAP
+%   Ppre = {x | Mx ∈ P}
+% If P = {y | A y <= b, Ae y = be}, then
+%        Ppre = {x | A M x <= b, Ae M x = be}
+% =========================================================================
+function Ppre = poly_preimage(P, M)
+    if isempty(P.Ae)
+        Ppre = Polyhedron('A', P.A*M, 'b', P.b);
+    else
+        Ppre = Polyhedron('A', P.A*M, 'b', P.b, ...
+                          'Ae', P.Ae*M, 'be', P.be);
+    end
+end
+
+
+
+% =========================================================================
+% 2) MAXIMAL RPI SET FOR x+ = Acl x + w, w ∈ W
+%
+% Iteration:
+%   R_0 = Xad
+%   R_{k+1} = Xad ∩ Pre(R_k)
+%   Pre(S) = {x | Acl x + w ∈ S, ∀w∈W}
+%          = {x | Acl x ∈ S ⊖ W}
+% =========================================================================
+function [R, info] = maximal_rpi_fixed_feedback(Acl, Xad, W, opts)
+    R = Xad;
+    converged = false;
+    iter = 0;
+
+    for k = 1:opts.maxIterMaxRPI
+        iter = k;
+
+        tightened = R - W;   % Pontryagin difference
+        if tightened.isEmptySet()
+            R = Polyhedron.emptySet(size(Acl,2));
+            converged = true;
+            break;
+        end
+
+        PreR = poly_preimage(tightened, Acl);
+        Rnext = Xad & PreR;
+
+        if Rnext.isEmptySet()
+            R = Rnext;
+            converged = true;
+            break;
+        end
+
+        if poly_equal(Rnext, R, opts.tol)
+            R = Rnext;
+            converged = true;
+            break;
+        end
+
+        R = Rnext;
+    end
+
+    info = struct();
+    info.iterations = iter;
+    info.converged = converged;
+end
+
+
+
+% =========================================================================
+% POLYHEDRON EQUALITY TEST BY MUTUAL CONTAINMENT
+% =========================================================================
+function tf = poly_equal(P, Q, tol)
+    tf = poly_contains_poly(P, Q, tol) && poly_contains_poly(Q, P, tol);
+end
+
+% =========================================================================
+% CHECK Q ⊆ P
+%
+% This version prefers a vertex test for bounded Q.
+% If vertex enumeration fails, it falls back to YALMIP support-function LPs.
+% =========================================================================
+function tf = poly_contains_poly(P, Q, tol)
+    if Q.isEmptySet()
+        tf = true;
+        return;
+    end
+
+    try
+        if Q.isBounded()
+            V = Q.V;
+            tf = true;
+            for i = 1:size(V,1)
+                if ~P.contains(V(i,:).', tol)
+                    tf = false;
+                    return;
+                end
+            end
+            return;
+        end
+    catch
+        % fall through to LP-based test below
+    end
+
+    tf = poly_contains_poly_lp(P, Q, tol);
+end
+
+% =========================================================================
+% LP-BASED CONTAINMENT TEST:
+%   Q ⊆ P  iff  max_{x∈Q} a_i x - b_i <= 0 for each facet a_i x <= b_i of P
+% =========================================================================
+function tf = poly_contains_poly_lp(P, Q, tol)
+    if Q.isEmptySet()
+        tf = true;
+        return;
+    end
+
+    H = P.A;
+    h = P.b;
+
+    x = sdpvar(Q.Dim,1);
+    C = poly_to_yalmip(Q, x, tol);
+
+    ops = sdpsettings('verbose', 0);
+
+    for i = 1:size(H,1)
+        obj = H(i,:)*x - h(i);
+        sol = optimize(C, -obj, ops);
+        if sol.problem ~= 0
+            error('Containment LP failed in poly_contains_poly_lp. problem=%d', sol.problem);
+        end
+        if value(obj) > tol
+            tf = false;
+            return;
+        end
+    end
+
+    tf = true;
+end
+
+% =========================================================================
+% CONVERT POLYHEDRON TO YALMIP CONSTRAINTS
+% =========================================================================
+function C = poly_to_yalmip(P, z, tol)
+    C = [];
+    if ~isempty(P.A)
+        C = [C, P.A*z <= P.b + tol];
+    end
+    if ~isempty(P.Ae)
+        C = [C, P.Ae*z == P.be];
+    end
+end
+
+% =========================================================================
+% VERIFY NOMINAL INVARIANCE OF P FOR x+ = Acl x
+% =========================================================================
+function rep = verify_nominal_invariance_yalmip(P, Acl, opts)
+    rep = struct('ok', false, 'maxViolation', inf, 'facetValues', []);
+
+    if P.isEmptySet()
+        rep.ok = true;
+        rep.maxViolation = -inf;
+        rep.facetValues = [];
+        return;
+    end
+
+    H = P.A;
+    h = P.b;
+
+    x = sdpvar(size(Acl,2),1);
+    C = poly_to_yalmip(P, x, opts.tol);
+
+    ops = sdpsettings('verbose', 0);
+    if ~isempty(opts.solver)
+        ops = sdpsettings(ops, 'solver', opts.solver);
+    end
+
+    vals = nan(size(H,1),1);
+    maxViol = -inf;
+
+    for i = 1:size(H,1)
+        obj = H(i,:)*(Acl*x) - h(i);
+        sol = optimize(C, -obj, ops);
+        if sol.problem ~= 0
+            error('YALMIP failed during nominal invariance verification. problem=%d', sol.problem);
+        end
+        vals(i) = value(obj);
+        maxViol = max(maxViol, vals(i));
+    end
+
+    rep.ok = (maxViol <= opts.tol);
+    rep.maxViolation = maxViol;
+    rep.facetValues = vals;
+end
+
+% =========================================================================
+% VERIFY ROBUST POSITIVE INVARIANCE OF P FOR x+ = Acl x + w, w ∈ W
+% =========================================================================
+function rep = verify_rpi_yalmip(P, Acl, W, opts)
+    rep = struct('ok', false, 'maxViolation', inf, 'facetValues', []);
+
+    if P.isEmptySet()
+        rep.ok = true;
+        rep.maxViolation = -inf;
+        rep.facetValues = [];
+        return;
+    end
+
+    H = P.A;
+    h = P.b;
+
+    x = sdpvar(size(Acl,2),1);
+    w = sdpvar(size(Acl,1),1);
+
+    C = [];
+    C = [C, poly_to_yalmip(P, x, opts.tol)];
+    C = [C, poly_to_yalmip(W, w, opts.tol)];
+
+    ops = sdpsettings('verbose', 0);
+    if ~isempty(opts.solver)
+        ops = sdpsettings(ops, 'solver', opts.solver);
+    end
+
+    vals = nan(size(H,1),1);
+    maxViol = -inf;
+
+    for i = 1:size(H,1)
+        obj = H(i,:)*(Acl*x + w) - h(i);
+        sol = optimize(C, -obj, ops);
+        if sol.problem ~= 0
+            error('YALMIP failed during robust invariance verification. problem=%d', sol.problem);
+        end
+        vals(i) = value(obj);
+        maxViol = max(maxViol, vals(i));
+    end
+
+    rep.ok = (maxViol <= opts.tol);
+    rep.maxViolation = maxViol;
+    rep.facetValues = vals;
+end
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+function [secOutputs] = DefineMPCProblem_TimeVaryingTube(model,secOutputs,options)
+% Function defines optimization problem of an MPC policy
+%
+% INPUTS:
+%     secOutputs.N             - Prediction horizon
+%     secOutputs.params_TVTMPC - precomputed parameters for the approach
+%     secOutputs.Pxu           - combined state-input constraints
+%     secOutputs.K             - LQR gain (u = K*x)
+%     model                    - defined model as MPT3 object
+%     options.LQRstability     - {0} Compute the terminal penalty/set w.r.t.
+%                                the ULTI system (given in 'model')
+%                                {1} Compute the terminal penalty/set w.r.t.
+%                                the LTI system (not the ULTI as in 'model')   
+%
+% OUTPUTS:
+% secOutputs.OptimProblem.MPCproblem                 - optimisation problem (mpt3)
+% secOutputs.OptimProblem.options                    - tube MPC options
+% secOutputs.OptimProblem.paramtext                  - list of required
+%                                                      parameters for the 
+%                                                      optimisation problem
+% secOutputs.OptimProblem.MPCoptimizers.compact      - optimizer that retuns
+%                                                      Utube = u_opt +
+%                                                      + K*(x-x_opt) (YALMIP)
+% secOutputs.OptimProblem.MPCoptimizers.exact        - optimizer that retuns
+
+
+
+% Determine MPC formulations that were given by the user
+MPCforms = DeterminTEMPCFormulations(model);
+
+% Decision variables (nominal)
+% u{k} = v_{k-1}, x{k} = z_{k-1}
+u = sdpvar(model.nu,secOutputs.N,'full');
+x = sdpvar(model.nx,secOutputs.N+1,'full');
+% Parameter (measured system state)
+X0 = sdpvar(model.nx,1);
+
+% Initialize constraints and objective function
+con = [];
+obj = 0;
+
+% predefine some variables used in hte MPC definition
+AK = model.A + model.B*secOutputs.K;
+Xf = secOutputs.params_TVTMPC.Xf;
+
+% ------------------------------ Constraints ------------------------------
+% Eq (3.11b): x - z0 \in X_f  =>  r_i^T (x - z0) <= 1   (normalized)
+% Here: x is measured state X0, z0 is x(:,1)
+con = [con, Xf.A*(X0 - x(:,1)) <= Xf.b];
+
+% Optional: keep measured state inside X bounds (not required by paper)
+con = [con, model.x.min <= X0 <= model.x.max];
+
+% Optional: keep nominal initial state z0 inside X (not required by paper)
+con = [con, model.x.min <= x(:,1) <= model.x.max];
+
+% Stage loop: paper k = 0..N-1 corresponds to MATLAB idx k = 1...N with kp=k-1
+for k = 1:secOutputs.N
+    % Eq(3.11a): nominal dynamics
+    con = [con, x(:,k+1) == model.A*x(:,k) + model.B*u(:,k)];
+
+    % ---------- Stage constraint tightening ----------
+    % For paper index kp = k-1, cross-section is 
+    % S_kp = MINKOWSKI_SUM_{j=0}^{kp-1} AK^j W
+    % => for k=1 (kp=0): NO subtraction
+    % => for k=2 (kp=1): subtract W
+    % => for k=3 (kp=2): subtract W + AK W, etc.
+    Xset = secOutputs.Px;
+    for j = 0:(k-2)
+        Xset = Xset - (AK^j)*secOutputs.Pw;
+    end
+
+    % Constraint: z_kp + AK^kp (X0 - z0) \in X - S_kp
+    % Here: z_kp is x{k}, z0 is x{1}, kp = k-1
+    con = [con, Xset.A*(x(:,k) + (AK^(k-1))*(X0 - x(:,1))) <= Xset.b];
+
+    % Input tightening: u = v + K(.) + K*s~, with s~ in S_kp
+    Uset = secOutputs.Pu;
+    for j = 0:(k-2)
+        Uset = Uset - secOutputs.K*(AK^j)*secOutputs.Pw;
+    end
+    con = [con, Uset.A*(u(:,k) + secOutputs.K*(AK^(k-1))*(X0 - x(:,1))) ...
+        <= Uset.b];
+end
+
+% % Delta-U constraints
+% if MPCforms.deltaucon
+%     uprev = sdpvar(model.nu,1,'full');
+%     Pdu = secOutputs.Pdu;
+%     for k = 1:secOutputs.N
+%         if k == 1
+%             con = [con, Pdu.A*(u(:,k) - uprev) <= Pdu.b];
+%         else
+%             con = [con, Pdu.A*(u(:,k) - u(:,k-1)) <= Pdu.b];
+%         end
+%     end
+% end
+% Delta-U constraints
+if MPCforms.deltaucon
+    uprev = sdpvar(model.nu,1,'full');
+    Pdu = secOutputs.Pdu;
+    for k = 1:secOutputs.N
+        if k == 1
+            Utube = u(:,k) + secOutputs.K*( X0 - x(:,k) );
+            con = [con, Pdu.A*(Utube - uprev) <= Pdu.b];
+        else
+%             Utube = u(:,k) + secOutputs.K*( x(:,k-1) - x(:,k) );
+%             con = [con, Pdu.A*(Utube - Utubeprev) <= Pdu.b];
+        end
+%         Utubeprev = Utube;
+    end
+end
+% -------------------------------------------------------------------------
+
+
+
+% --------------------------- Objective function --------------------------
+for k = 1:secOutputs.N
+    % Cost: sum z_k^T Q z_k + v_k^T R v_k
+    obj = obj + x(:,k)'*model.x.penalty.weight*x(:,k) + ...
+                u(:,k)'*model.u.penalty.weight*u(:,k);
+end
+% ------------------------------------------------------------------------
+
+
+
+% --------------------------- Terminal obj-cons ---------------------------
+if options.LQRstability
+    model = ComputeLQRSet(model);
+end
+
+% Terminal constraint
+if isprop(model.x,'terminalSet')
+    % Eq(3.11d): z_N + AK^N (X0 - z0) \in Xf - S_N
+    XN = secOutputs.params_TVTMPC.Xf;
+    for k = 0:(secOutputs.N-2)
+        XN = XN - (AK^k)*secOutputs.Pw;
+    end
+    con = [con, XN.A*( x(:,end) + (AK^secOutputs.N)*(X0 - x(:,1)) ) <= XN.b];
+end
+
+% Terminal penalty
+if isprop(model.x,'terminalPenalty')
+    obj = obj + x(:,end)'*model.x.terminalPenalty.weight*x(:,end);
+end
+% ------------------------------------------------------------------------
+
+
+
+% ---------------------------- MPC definition -----------------------------
+% Optimization settings - silent verbose mode
+opt_settings = sdpsettings('verbose',0);
+
+p_required = X0;
+paramtext = 'parameters = [X0';
+if any([MPCforms.deltaucon,MPCforms.deltaupen])
+    p_required = [p_required; uprev];
+    paramtext = ';uprev';
+end
+paramtext = [paramtext, ']'];
+
+% Note that the TEMPC will have always p_return = [u(:,1); x(:,1)].
+% If required, by solType ==1, then this primal function will be
+% overwritten inside of the .toExplicit function
+OptimProblem.options = options;
+OptimProblem.MPCforms = MPCforms;
+OptimProblem.MPCproblem = Opt(con, obj, p_required, ...
+    [u(:,1); x(:,1)]);
+% construct compact/exact optimizers
+OptimProblem.MPCoptimizers.compact = optimizer(con, obj, opt_settings, ...
+    p_required, [obj(:); u(:,1) + secOutputs.K*( X0 - x(:,1))]);
+OptimProblem.MPCoptimizers.exact = optimizer(con, obj, opt_settings, ...
+    p_required, [obj(:); u(:); x(:)]);
+OptimProblem.paramtext = paramtext;
+% Save all results
+secOutputs.OptimProblem = OptimProblem;
+end
+
+
+
+function  [form] = DeterminTMPCFormulations(model)
+% Available MPC forms
+form.deltaucon = 0;
+form.deltaupen = 0;
+form.ytrack = 0;
+form.xtrack = 0;
+form.xterminalPenalty = 0;
+form.ublock = 0;
+form.softcon = 0;
+
+if  any([isprop(model.u,'deltaMin'),isprop(model.u,'deltaMax')])
+    form.deltaucon = 1;
+end
+
+if isprop(model.u,'deltaPenalty')
+    form.deltaupen = 1;
+end
+
+if isprop(model.x,'reference')
+    form.xtrack = 1;
+end
+
+if isprop(model.y,'reference')
+    form.ytrack = 1;
+end
+
+if isprop(model.x,'terminalPenalty')
+    form.xterminalPenalty = 1;
+end
+
+if isprop(model.u,'block')
+    form.ublock = 1;
+end
+
+con1 = [isprop(model.x,'softMin'),isprop(model.x,'softMax')];
+con2 = [isprop(model.u,'softMin'),isprop(model.u,'softMax')];
+con3 = [isprop(model.y,'softMin'),isprop(model.y,'softMax')];
+if  any([con1; con2; con3])
+    form.softcon = 1;
+end
+end
+
+
+function [] = CheckFeasibleSetup(model,options)
+
+form = DeterminTMPCFormulations(model);
+
+switch options.TubeType
+    case {'explicit','implicit','timevarying'}
+        % Errors
+        if form.deltaucon && (options.solType == 0)
+            error('MPTplus does not support Tube MPC with delta-u constraints with solType = 0 (use solType = 1), yet.')
+        elseif form.deltaupen
+            error('MPTplus does not support Tube MPC with delta-u penalization, yet.')
+        elseif form.ytrack
+            error('MPTplus does not support Tube MPC with y-tracking, yet.')
+        elseif form.xtrack
+            error('MPTplus does not support Tube MPC with x-tracking, yet.')
+        elseif form.ublock
+            error('MPTplus does not support Tube MPC with move-blocking, yet.')
+        elseif form.softcon
+            error('MPTplus does not support Tube MPC with soft constraints, yet.')
+        end
+
+        % Warnings
+        if form.xterminalPenalty
+            warning('MPTplus: Terminal penalty was selected by the user. Check if it was desinged for the nominal system (not the uncertain).')
+        end
+        if any([options.Nz, all(~isnan(options.Kz),'all'), all(~isnan(options.Pz),'all')])
+            warning('MPTplus: Multiple terminal steps "Nz" / controller "Kz" / or penalty "Pz" are not supported in this tube-type. (They do not have effect on the MPC.)')
+        end
+        if form.deltaucon
+             warning('MPTplus: Note that the delta-u constraints are enforced only for the nominal control actions u_opt (not the RHC: Utube = u_opt + K*( x - x_opt )).')
+        end
+    case 'elastic'
+                % Errors
+        if form.deltaucon && (options.solType == 0)
+            error('MPTplus does not support Tube MPC with delta-u constraints with solType = 0 (use solType = 1), yet.')
+        elseif form.deltaupen
+            error('MPTplus does not support Tube MPC with delta-u penalization, yet.')
+        elseif form.ytrack
+            error('MPTplus does not support Tube MPC with y-tracking, yet.')
+        elseif form.xtrack
+            error('MPTplus does not support Tube MPC with x-tracking, yet.')
+        elseif form.ublock
+            error('MPTplus does not support Tube MPC with move-blocking, yet.')
+        elseif form.softcon
+            error('MPTplus does not support Tube MPC with soft constraints, yet.')
+        end
+
+        % Warnings
+        if form.xterminalPenalty
+            warning('MPTplus: Terminal penalty was selected by the user. Check if it was desinged for the nominal system (not the uncertain).')
+        end
+end
+end
+
+
+
+
+
+
+
+

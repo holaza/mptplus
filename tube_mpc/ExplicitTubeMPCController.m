@@ -1,4 +1,4 @@
-classdef ExplicitTubeMPCController < EMPCController
+classdef ExplicitTubeMPCController < EMPCController & TubeMPCControllerPlotes
     % Class representing explicit tube MPC controllers
     %
     % Constructor:
@@ -7,6 +7,9 @@ classdef ExplicitTubeMPCController < EMPCController
 
     properties
         TMPCparams
+    end
+    properties (Access = private)
+        Plotter
     end
 
     methods
@@ -31,6 +34,9 @@ classdef ExplicitTubeMPCController < EMPCController
             else
                 obj.TMPCparams = NaN;
             end
+
+            % create plotting helper object
+            obj.Plotter = TubeMPCControllerPlotes();
         end
 
 
@@ -102,7 +108,7 @@ classdef ExplicitTubeMPCController < EMPCController
                 nx = mpc.TMPCparams.nx;
                 nu = mpc.TMPCparams.nu;
                 K = mpc.TMPCparams.K;
-                W = mpc.TMPCparams.Wset;
+                W = mpc.TMPCparams.Pw;
                 A = mpc.model.A;
                 B = mpc.model.B;
                 Q = mpc.model.x.penalty.H;
@@ -120,7 +126,7 @@ classdef ExplicitTubeMPCController < EMPCController
                 % Initialization of the closed-loop control outputs
                 X = xinit; % initial system state
                 Unominal = []; % initial nominal control action
-                Xnominal = [ xinit ]; % initial nominal system states
+                Xnominal = []; % initial nominal system states
                 Udata = []; % initial closed-loop control action
                 Xdata = [ X ]; % initial closed-loop system states
                 cost = 0;
@@ -153,11 +159,37 @@ classdef ExplicitTubeMPCController < EMPCController
             end % if ( solType == 0 )
         end % function
 
+
+
         function [] = indexPartition( obj, indices2depict, figureHandle )
             % Function indexPartition plot parition and  depicts indices of each
             % critical region.
             obj.partition.plot
             depictIndices( obj, [1 : obj.nr], gcf )
+        end
+
+
+
+        function PlotStateTrajectory(obj,x0,Nsim)
+            % -------------------------------------------------------------
+            %               PlotStateTrajectory(TMPC,x0,Nsim)
+            % -------------------------------------------------------------
+            % Function plots open-loop / closed-loop state trajectory.The
+            % closed-loop is choosen by providing 'Nsim'.
+            % -------------------------------------------------------------
+            % INPUTS:
+            %       TMPC    -   Tube MPC policy
+            %       x0      -   Initial condition
+            %       Nsim    -   Number of simuation steps
+            % -------------------------------------------------------------
+
+            if nargin < 3
+                error('MPTplus: We are sorry, but open-loop trajectories for the explicit Tube MPC is not supported, yet. (Use closed-loop prifile by adding another input (number of simulation steps) to the function.)')
+%                 obj.Plotter.PlotStateTrajectory(obj,x0);
+            else
+                obj.Plotter.PlotStateTrajectory(obj,x0,Nsim);
+            end
+
         end
 
     end

@@ -9,6 +9,9 @@ classdef TubeMPCController < MPCController
     properties
         TMPCparams
     end
+    properties (Access = private)
+        Plotter
+    end
 
     methods
 
@@ -36,6 +39,9 @@ classdef TubeMPCController < MPCController
             else
                 obj.TMPCparams = NaN;
             end
+
+            % create plotting helper object
+            obj.Plotter = TubeMPCControllerPlotes();
         end
 
         function EMPC = toExplicit(obj)
@@ -153,7 +159,7 @@ classdef TubeMPCController < MPCController
                     u = U(2 : obj.TMPCparams.nu+1);
                 elseif ( solType == 0 )
                     switch obj.TMPCparams.OptimProblem.options.TubeType
-                        case {'explicit','implicit'}
+                        case {'explicit','implicit','timevarying'}
                             % Return exact control law: [u0, x0]
 
                             % U_exact = reshape( U(2 : nu*N + 1 ), [nu, N] )
@@ -174,12 +180,12 @@ classdef TubeMPCController < MPCController
                             start = fin + 1;
                             fin = start + obj.TMPCparams.nx*(obj.TMPCparams.N + 1) -1;
                             X_exact = reshape ( U( start : fin) , [ obj.TMPCparams.nx, obj.TMPCparams.N+1 ] );
-                            
+
                             % sigma_exact = reshape( U(nu*N + 2 + nx*(N+1) : nu*N + 2 + nx*(N+1) + qs*N  - 1), [qs, N] )
                             start = fin + 1;
                             fin = start + obj.TMPCparams.elasticparams.qs*(obj.TMPCparams.N) - 1;
                             sigma_exact = reshape ( U( start : fin) , [ obj.TMPCparams.elasticparams.qs, obj.TMPCparams.N ] );
-                            
+
                             u = [ U_exact( : , 1 ); X_exact( : , 1 ); sigma_exact(:,1) ]; % return 1st contol step: [u0, x0, sigma0]
                         otherwise
                             error('MPTplus: Incorrect TubeType found during control action evaluation!')
@@ -199,7 +205,7 @@ classdef TubeMPCController < MPCController
                     openloop.info = 'OPENLOOP evaluation of Tube MPC is under cosntruction.';
                 elseif ( solType == 0 )
                     switch obj.TMPCparams.OptimProblem.options.TubeType
-                        case {'explicit','implicit'}
+                        case {'explicit','implicit','timevarying'}
                             % U' = [ cost, [u(0)',...,u(N-1)'], [x(0)',...,x(N)'] ]
                             openloop.cost = J;
                             openloop.U = U_exact;
@@ -260,7 +266,7 @@ classdef TubeMPCController < MPCController
                 % Initialization of the closed-loop control outputs
                 X = xinit; % initial system state
                 Unominal = []; % initial nominal control action
-                Xnominal = [ xinit ]; % initial nominal system states
+                Xnominal = []; % initial nominal system states
                 Udata = []; % initial closed-loop control action
                 Xdata = [ X ]; % initial closed-loop system states
                 if strcmpi(tubeType,'elastic'), SIGMAnominal = []; end
@@ -274,8 +280,8 @@ classdef TubeMPCController < MPCController
                     U_opt = UX_opt(1:nu);
                     X_opt = UX_opt(nu+1 : nu+nx);
                     Utube = U_opt + K*( X - X_opt );
-                    if strcmpi(tubeType,'elastic') 
-                        Sigma = UX_opt(nu+nx+1:nu+nx + mpc.TMPCparams.elasticparams.qs); 
+                    if strcmpi(tubeType,'elastic')
+                        Sigma = UX_opt(nu+nx+1:nu+nx + mpc.TMPCparams.elasticparams.qs);
                         Utube = U_opt + mpc.TMPCparams.elasticparams.Ka(Sigma)*( X - X_opt );
                     end
                     % Uncertain (noisy) LTI system: X(k+1) = A*X(k) + B*U(k)
@@ -285,7 +291,7 @@ classdef TubeMPCController < MPCController
                     Xnominal = [Xnominal, X_opt];
                     Udata = [Udata, Utube];
                     if strcmpi(tubeType,'elastic')
-                        SIGMAnominal = [SIGMAnominal,Sigma]; 
+                        SIGMAnominal = [SIGMAnominal,Sigma];
                     end
                     cost = cost + X'*Q*X + Utube'*R*Utube; % Quadratic cost
                 end
@@ -297,15 +303,20 @@ classdef TubeMPCController < MPCController
                 ClosedLoopData.Unominal = Unominal;
                 ClosedLoopData.Xnominal = Xnominal;
                 ClosedLoopData.K = K;
-                if strcmpi(tubeType,'elastic') 
+                if strcmpi(tubeType,'elastic')
                     ClosedLoopData.K = mpc.TMPCparams.elasticparams.Ka();
-                    ClosedLoopData.SIGMAnominal = SIGMAnominal; 
+                    ClosedLoopData.SIGMAnominal = SIGMAnominal;
+                end
+
+                try
+                    ClosedLoopData = mpt.extras.DataRecorder(ClosedLoopData);
+                catch
                 end
             else
-                %% if ( solType == 1 ) 
+                %% if ( solType == 1 )
                 [ ClosedLoopData ] = obj.simulate@MPCController(xinit, Nsim, varargin{:});
-                
-                % Overwrite original MPT3 "cost" (NaN) with the closed loop cost 
+
+                % Overwrite original MPT3 "cost" (NaN) with the closed loop cost
                 cost = 0;
                 Q = obj.model.x.penalty.H;
                 R = obj.model.u.penalty.H;
@@ -316,10 +327,100 @@ classdef TubeMPCController < MPCController
                     U = ClosedLoopData.U(:,k);
                     cost = cost + X'*Q*X + U'*R*U; % Quadratic cost
                 end
-                ClosedLoopData.cost = cost; 
+                ClosedLoopData.cost = cost;
 
             end % if ( solType == 0 )
         end % function
+
+
+
+        function [Tube,compTime] = ConstructExplicitTube(obj,Nsgiven)
+            % Invariant Approximations of the Minimal Robust Positively Invariant Set
+            % by S. V. Rakovic, E. C. Kerrigan, K. I. Kouramas, D. Q. Mayne
+            % IEEE TRANSACTIONS ON AUTOMATIC CONTROL, VOL. 50, NO. 3, MARCH 2005
+            % URL: https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=1406138
+
+            % Extract data
+            model = obj.model;
+            secOutputs = obj.TMPCparams;
+            A = model.A;
+            B = model.B;
+            K = secOutputs.K;
+            W = secOutputs.Pw;
+            Ns = secOutputs.Ns;
+            if nargin > 1; Ns = min(max(Nsgiven,1),secOutputs.Ns);  end
+            alpha = secOutputs.alpha;
+
+            % Closed-loop/autonomous system matrix
+            Acl = A + B*K;
+
+            % Eq(2): Fs = Minkowski_Sum_{i=0}^{s-1}( Acl^(i)*W ), where F_0 = {0}
+            tic;
+            Fs = W;
+            for i = 1 : (Ns - 1)
+                if size(Fs.V,1) > 2e5
+                    input('\nMPTplus: The tube is too complex! \nPress enter to continue or terminate the script.\n(Consider using "TubeType = implicit" instead of the "TubeType = explicit")')
+                end
+                obj.ShowProgress('Construction of an explicit tube...',i,Ns-1)
+                Fs = Fs + Acl^(i)*W;
+                Fs.minVRep();
+            end
+            Tube = (1 - alpha)^(-1)*Fs;
+            compTime = toc;
+            % fprintf('...done! (computation time: %.2f, #iterations: %.0f, #halfspaces = %.0f)\n',compTime,s,size(Fs.H,1))
+            fprintf('\b (computation time: %.2f, #iterations: %.0f, #halfspaces = %.0f)\n',compTime,Ns,size(Fs.H,1))
+
+            % Normalize the tube:
+            % Tube = NormalizePolyhedron(Tube.minHRep);
+            if any(Tube.b <= 0), error('MPTplus: Ups, normalization of the polyhedron failed!'); end
+            Tube = Polyhedron('A',Tube.A.*Tube.b.^(-1),'b',Tube.b.*Tube.b.^(-1));
+        end
+
+
+
+        function PlotStateTrajectory(obj,x0,Nsim)
+            % -------------------------------------------------------------
+            %               PlotStateTrajectory(TMPC,x0,Nsim)
+            % -------------------------------------------------------------
+            % Function plots open-loop / closed-loop state trajectory.The
+            % closed-loop is choosen by providing 'Nsim'.
+            % -------------------------------------------------------------
+            % INPUTS:
+            %       TMPC    -   Tube MPC policy
+            %       x0      -   Initial condition
+            %       Nsim    -   Number of simuation steps
+            % -------------------------------------------------------------
+
+            if nargin < 3
+                obj.Plotter.PlotStateTrajectory(obj,x0);
+            else
+                obj.Plotter.PlotStateTrajectory(obj,x0,Nsim);
+            end
+
+        end
     end
 
+    methods (Static)
+        function ShowProgress(operation, k, kf)
+            % Inputs:
+            %          operation - sting
+            %          k         - current iteration
+            %          kf        - final number of iterations
+            %          ttime     - time of the previous operation
+
+            % if k == 1, fprintf(1, strcat(operation,'       :')); end
+            if k == 1, fprintf(1, strcat(operation,'    :')); end
+
+            kkf = fix(k/kf*100);
+            if kkf < 10
+                fprintf(1, ' \b\b\b\b%d %%', kkf);
+            else
+                fprintf(1, ' \b\b\b\b\b%d %%', kkf);
+            end
+
+            if k == kf
+                fprintf('\n');
+            end
+        end
+    end
 end
