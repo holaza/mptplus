@@ -383,14 +383,15 @@ function [secOutputs] = PreProcessing_TimeVaryingTube(model,secOutputs)
 %
 % INPUTS:
 %           model                   - model of the system (as MPT3 object)
+%           secOutputs.Pxu          - State-Input constraints
 %           secOutputs.K            - LQR gain
 %           secOutputs.Pw           - Bounded additive uncertainty
-%           secOutputs.Px           - state constraints 
-%           secOutputs.Pu           - input constraints
 %           secOutputs.N            - Prediction horizon
 % OUTPUTS:
-%           secOutputs.params_TVTMPC.Xf - maximal robust positive invariant set
-
+%           secOutputs.timeVaryingParams.Xf      - maximal robust positive invariant set
+%           secOutputs.timeVaryingParams.f       - Precompute tightenings f(k,i) from Eq. (3.6)
+%           secOutputs.timeVaryingParams.g       - Precompute tightenings g(i) from Eq. (3.8)
+%           secOutputs.timeVaryingParams.AKpower - AKpower{k+1} = A_K^k
 
 
 % Checks of supported functionalities:
@@ -410,9 +411,54 @@ Xf = out.R_max;
 if Xf.isEmptySet
     error('Cannot continue as the minimal positive invariant set is empty!')
 end
+% Normalize the RPIS
+Xf = NormalizePolyhedron(Xf.minHRep);
+
+% Precompute powers of A_K: AKpower{k+1} = A_K^k
+AKpower = cell(secOutputs.N+1,1);
+AKpower{1} = eye(model.nx);        % A_K^0
+for k = 2:(secOutputs.N+1)
+    AKpower{k} = AKpower{k-1} * (model.A + model.B*secOutputs.K);
+end
+
+% For each i, eta_i := c_i + K^T d_i  (as in the paper text near Eq. (3.11)
+% - equivalently eta_i^T = c_i^T + K^T d_i^T)
+C = secOutputs.Pxu.A(:,1:model.nx);
+D = secOutputs.Pxu.A(:,model.nx+1:end);
+Eta = C + D*secOutputs.K;  
+
+% Precompute tightenings f(k,i) from Eq. (3.6)
+% Eq. (3.6): f(k,i) = sum_{j=0}^{k-1} h_W( (A_K^j)^T eta_i ), with f(0,i)=0
+% We need k = 0...N-1 for stage constraints (3.11c)
+nPxu = size(secOutputs.Pxu.A,1);
+f = zeros(secOutputs.N, nPxu); % rows correspond to k = 0...N-1
+% f(0,i) already zero
+for k = 1:(secOutputs.N-1) % compute f(k, i) using recursion: f(k+1)=f(k)+hW((A_K^k)^T eta)f
+    for i = 1:nPxu
+        dir = (AKpower{k}') * (Eta(i,:)');  % (A_K^k)^T * eta_i
+        f(k+1,i) = f(k,i) + support(secOutputs.Pw, dir);
+    end
+end
+
+% Precompute tightenings g(i) from Eq. (3.8)
+% Eq(3.8): g_i = sum_{j=0}^{N-1} h_W( (A_K^j)^T r_i )
+nf = size(Xf.A,1);
+g = zeros(nf,1);
+for i = 1:nf
+    acc = 0;
+    ri = Xf.A(i,:)';
+    for j = 0:(secOutputs.N-1)
+        acc = acc + support(secOutputs.Pw, (AKpower{j+1}') * ri);
+    end
+    g(i) = acc;
+end
 
 % Store all computed
 secOutputs.params_TVTMPC.Xf = Xf;
+secOutputs.params_TVTMPC.f = f;
+secOutputs.params_TVTMPC.g = g;
+secOutputs.params_TVTMPC.AKpower = AKpower;
+secOutputs.params_TVTMPC.Eta = Eta;
 end
 
 
@@ -2010,14 +2056,12 @@ X0 = sdpvar(model.nx,1);
 con = [];
 obj = 0;
 
-% predefine some variables used in hte MPC definition
-AK = model.A + model.B*secOutputs.K;
-Xf = secOutputs.params_TVTMPC.Xf;
+
 
 % ------------------------------ Constraints ------------------------------
 % Eq (3.11b): x - z0 \in X_f  =>  r_i^T (x - z0) <= 1   (normalized)
 % Here: x is measured state X0, z0 is x(:,1)
-con = [con, Xf.A*(X0 - x(:,1)) <= Xf.b];
+con = [con, secOutputs.params_TVTMPC.Xf.A*(X0 - x(:,1)) <= secOutputs.params_TVTMPC.Xf.b];
 
 % Optional: keep measured state inside X bounds (not required by paper)
 con = [con, model.x.min <= X0 <= model.x.max];
@@ -2030,28 +2074,13 @@ for k = 1:secOutputs.N
     % Eq(3.11a): nominal dynamics
     con = [con, x(:,k+1) == model.A*x(:,k) + model.B*u(:,k)];
 
-    % ---------- Stage constraint tightening ----------
-    % For paper index kp = k-1, cross-section is 
-    % S_kp = MINKOWSKI_SUM_{j=0}^{kp-1} AK^j W
-    % => for k=1 (kp=0): NO subtraction
-    % => for k=2 (kp=1): subtract W
-    % => for k=3 (kp=2): subtract W + AK W, etc.
-    Xset = secOutputs.Px;
-    for j = 0:(k-2)
-        Xset = Xset - (AK^j)*secOutputs.Pw;
-    end
+    % Eq(3.11c): for all i in I_Y
+    % c_i^T z_k + d_i^T v_k + eta_i^T A_K^k (x - z0) <= 1 - f(k,i)
+    delta = secOutputs.params_TVTMPC.AKpower{k}*(X0 - x(:,1));  % A_K^kp (x - z0)
+    gamma = secOutputs.params_TVTMPC.Eta*delta;
 
-    % Constraint: z_kp + AK^kp (X0 - z0) \in X - S_kp
-    % Here: z_kp is x{k}, z0 is x{1}, kp = k-1
-    con = [con, Xset.A*(x(:,k) + (AK^(k-1))*(X0 - x(:,1))) <= Xset.b];
-
-    % Input tightening: u = v + K(.) + K*s~, with s~ in S_kp
-    Uset = secOutputs.Pu;
-    for j = 0:(k-2)
-        Uset = Uset - secOutputs.K*(AK^j)*secOutputs.Pw;
-    end
-    con = [con, Uset.A*(u(:,k) + secOutputs.K*(AK^(k-1))*(X0 - x(:,1))) ...
-        <= Uset.b];
+    con = [con, secOutputs.Pxu.A*[x(:,k);u(:,k)] + gamma <= ...
+                secOutputs.Pxu.b - secOutputs.params_TVTMPC.f(k,:)'];
 end
 
 % % Delta-U constraints
@@ -2102,12 +2131,14 @@ end
 
 % Terminal constraint
 if isprop(model.x,'terminalSet')
-    % Eq(3.11d): z_N + AK^N (X0 - z0) \in Xf - S_N
-    XN = secOutputs.params_TVTMPC.Xf;
-    for k = 0:(secOutputs.N-2)
-        XN = XN - (AK^k)*secOutputs.Pw;
+    % Eq(3.11d): terminal constraints, for all i in I_Xf
+    % r_i^T z_N + r_i^T A_K^N (x - z0) <= 1 - g_i
+    deltaN = secOutputs.params_TVTMPC.AKpower{secOutputs.N+1}*(X0 - x(:,1));
+    Rf = secOutputs.params_TVTMPC.Xf.A;
+    g = secOutputs.params_TVTMPC.g;
+    for i = 1:size(Rf,1)
+        con = [con, Rf(i,:)*x(:,end) + Rf(i,:)*deltaN <= 1 - g(i)];
     end
-    con = [con, XN.A*( x(:,end) + (AK^secOutputs.N)*(X0 - x(:,1)) ) <= XN.b];
 end
 
 % Terminal penalty
